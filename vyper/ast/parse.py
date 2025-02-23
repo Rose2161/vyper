@@ -1,15 +1,16 @@
 import ast as python_ast
+import pickle
 import tokenize
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Union, cast
-
-import asttokens
+from functools import cached_property
+from typing import Any, Dict, List, Optional, Union
 
 from vyper.ast import nodes as vy_ast
-from vyper.ast.pre_parser import pre_parse
+from vyper.ast.pre_parser import PreParser
 from vyper.compiler.settings import Settings
 from vyper.exceptions import CompilerPanic, ParserException, SyntaxException
-from vyper.typing import ModificationOffsets
+from vyper.utils import sha256sum
+from vyper.warnings import Deprecation, vyper_warn
 
 
 def parse_to_ast(*args: Any, **kwargs: Any) -> vy_ast.Module:
@@ -18,18 +19,36 @@ def parse_to_ast(*args: Any, **kwargs: Any) -> vy_ast.Module:
 
 
 def parse_to_ast_with_settings(
-    source_code: str,
+    vyper_source: str,
     source_id: int = 0,
     module_path: Optional[str] = None,
     resolved_path: Optional[str] = None,
     add_fn_node: Optional[str] = None,
+    is_interface: bool = False,
+) -> tuple[Settings, vy_ast.Module]:
+    try:
+        return _parse_to_ast_with_settings(
+            vyper_source, source_id, module_path, resolved_path, add_fn_node, is_interface
+        )
+    except SyntaxException as e:
+        e.resolved_path = resolved_path
+        raise e
+
+
+def _parse_to_ast_with_settings(
+    vyper_source: str,
+    source_id: int = 0,
+    module_path: Optional[str] = None,
+    resolved_path: Optional[str] = None,
+    add_fn_node: Optional[str] = None,
+    is_interface: bool = False,
 ) -> tuple[Settings, vy_ast.Module]:
     """
     Parses a Vyper source string and generates basic Vyper AST nodes.
 
     Parameters
     ----------
-    source_code : str
+    vyper_source: str
         The Vyper source code to parse.
     source_id : int, optional
         Source id to use in the `src` member of each node.
@@ -46,20 +65,47 @@ def parse_to_ast_with_settings(
     resolved_path: str, optional
         The resolved path of the source code
         Corresponds to FileInput.resolved_path
+    is_interface: bool
+        Indicates whether the source code should
+        be parsed as an interface file.
 
     Returns
     -------
     list
         Untyped, unoptimized Vyper AST nodes.
     """
-    if "\x00" in source_code:
+    if "\x00" in vyper_source:
         raise ParserException("No null bytes (\\x00) allowed in the source code.")
-    settings, class_types, reformatted_code = pre_parse(source_code)
+    pre_parser = PreParser()
+    pre_parser.parse(vyper_source)
     try:
-        py_ast = python_ast.parse(reformatted_code)
+        py_ast = python_ast.parse(pre_parser.reformatted_code)
     except SyntaxError as e:
-        # TODO: Ensure 1-to-1 match of source_code:reformatted_code SyntaxErrors
-        raise SyntaxException(str(e), source_code, e.lineno, e.offset) from e
+        offset = e.offset
+        if offset is not None:
+            # SyntaxError offset is 1-based, not 0-based (see:
+            # https://docs.python.org/3/library/exceptions.html#SyntaxError.offset)
+            offset -= 1
+
+            # adjust the column of the error if it was modified by the pre-parser
+            if e.lineno is not None:  # help mypy
+                offset += pre_parser.adjustments.get((e.lineno, offset), 0)
+
+        new_e = SyntaxException(str(e), vyper_source, e.lineno, offset)
+
+        likely_errors = ("staticall", "staticcal")
+        tmp = str(new_e)
+        for s in likely_errors:
+            if s in tmp:
+                new_e._hint = "did you mean `staticcall`?"
+                break
+
+        raise new_e from None
+
+    # some python AST node instances are singletons and are reused between
+    # parse() invocations. copy the python AST so that we are using fresh
+    # objects.
+    py_ast = _deepcopy_ast(py_ast)
 
     # Add dummy function node to ensure local variables are treated as `AnnAssign`
     # instead of state variables (`VariableDecl`)
@@ -71,17 +117,29 @@ def parse_to_ast_with_settings(
 
     annotate_python_ast(
         py_ast,
-        source_code,
-        class_types,
-        source_id,
+        vyper_source,
+        pre_parser,
+        source_id=source_id,
         module_path=module_path,
         resolved_path=resolved_path,
     )
 
+    # postcondition: consumed all the for loop annotations
+    assert len(pre_parser.for_loop_annotations) == 0
+
+    # postcondition: we have used all the hex strings found by the
+    # pre-parser
+    assert len(pre_parser.hex_string_locations) == 0
+
     # Convert to Vyper AST.
     module = vy_ast.get_node(py_ast)
     assert isinstance(module, vy_ast.Module)  # mypy hint
-    return settings, module
+    module.is_interface = is_interface
+
+    return pre_parser.settings, module
+
+
+LINE_INFO_FIELDS = ("lineno", "col_offset", "end_lineno", "end_col_offset")
 
 
 def ast_to_dict(ast_struct: Union[vy_ast.VyperNode, List]) -> Union[Dict, List]:
@@ -109,28 +167,114 @@ def dict_to_ast(ast_struct: Union[Dict, List]) -> Union[vy_ast.VyperNode, List]:
     raise CompilerPanic(f'Unknown ast_struct provided: "{type(ast_struct)}".')
 
 
+def annotate_python_ast(
+    parsed_ast: python_ast.Module,
+    vyper_source: str,
+    pre_parser: PreParser,
+    source_id: int = 0,
+    module_path: Optional[str] = None,
+    resolved_path: Optional[str] = None,
+) -> python_ast.AST:
+    """
+    Annotate and optimize a Python AST in preparation conversion to a Vyper AST.
+
+    Parameters
+    ----------
+    parsed_ast : AST
+        The AST to be annotated and optimized.
+    vyper_source: str
+        The original vyper source code
+    pre_parser: PreParser
+        PreParser object.
+
+    Returns
+    -------
+        The annotated and optimized AST.
+    """
+    visitor = AnnotatingVisitor(
+        vyper_source, pre_parser, source_id, module_path=module_path, resolved_path=resolved_path
+    )
+    visitor.start(parsed_ast)
+
+    return parsed_ast
+
+
+def _deepcopy_ast(ast_node: python_ast.AST):
+    # pickle roundtrip is faster than copy.deepcopy() here.
+    return pickle.loads(pickle.dumps(ast_node))
+
+
 class AnnotatingVisitor(python_ast.NodeTransformer):
     _source_code: str
-    _modification_offsets: ModificationOffsets
+    _pre_parser: PreParser
 
     def __init__(
         self,
         source_code: str,
-        modification_offsets: Optional[ModificationOffsets],
-        tokens: asttokens.ASTTokens,
+        pre_parser: PreParser,
         source_id: int,
         module_path: Optional[str] = None,
         resolved_path: Optional[str] = None,
     ):
-        self._tokens = tokens
         self._source_id = source_id
         self._module_path = module_path
         self._resolved_path = resolved_path
-        self._source_code: str = source_code
+        self._source_code = source_code
+        self._pre_parser = pre_parser
+
         self.counter: int = 0
-        self._modification_offsets = {}
-        if modification_offsets is not None:
-            self._modification_offsets = modification_offsets
+
+    @cached_property
+    def source_lines(self):
+        return self._source_code.splitlines(keepends=True)
+
+    @cached_property
+    def line_offsets(self):
+        ofst = 0
+        # ensure line_offsets has at least 1 entry for 0-line source
+        ret = {1: ofst}
+        for lineno, line in enumerate(self.source_lines):
+            ret[lineno + 1] = ofst
+            ofst += len(line)
+        return ret
+
+    def start(self, node: python_ast.Module):
+        self._fix_missing_locations(node)
+        self.visit(node)
+
+    def _fix_missing_locations(self, ast_node: python_ast.Module):
+        """
+        adapted from cpython Lib/ast.py. adds line/col info to ast,
+        but unlike Lib/ast.py, adjusts *all* ast nodes, not just the
+        one that python defines to have line/col info.
+        https://github.com/python/cpython/blob/62729d79206014886f5d/Lib/ast.py#L228
+        """
+        assert isinstance(ast_node, python_ast.Module)
+        ast_node.lineno = 1
+        ast_node.col_offset = 0
+        ast_node.end_lineno = max(1, len(self.source_lines))
+
+        if len(self.source_lines) > 0:
+            ast_node.end_col_offset = len(self.source_lines[-1])
+        else:
+            ast_node.end_col_offset = 0
+
+        def _fix(node, parent=None):
+            for field in LINE_INFO_FIELDS:
+                if parent is not None:
+                    val = getattr(node, field, None)
+                    # special case for USub - heisenbug when coverage is
+                    # enabled in the test suite.
+                    if val is None or isinstance(node, python_ast.USub):
+                        val = getattr(parent, field)
+                    setattr(node, field, val)
+                else:
+                    assert hasattr(node, field), node
+
+            for child in python_ast.iter_child_nodes(node):
+                _fix(child, node)
+
+        _fix(ast_node)
 
     def generic_visit(self, node):
         """
@@ -139,32 +283,28 @@ class AnnotatingVisitor(python_ast.NodeTransformer):
         # Decorate every node with the original source code to allow pretty-printing errors
         node.full_source_code = self._source_code
         node.node_id = self.counter
-        node.ast_type = node.__class__.__name__
         self.counter += 1
+        node.ast_type = node.__class__.__name__
 
-        # Decorate every node with source end offsets
-        start = node.first_token.start if hasattr(node, "first_token") else (None, None)
-        end = (None, None)
-        if hasattr(node, "last_token"):
-            end = node.last_token.end
-            if node.last_token.type == 4:
-                # token type 4 is a `\n`, some nodes include a trailing newline
-                # here we ignore it when building the node offsets
-                end = (end[0], end[1] - 1)
+        adjustments = self._pre_parser.adjustments
 
-        node.lineno = start[0]
-        node.col_offset = start[1]
-        node.end_lineno = end[0]
-        node.end_col_offset = end[1]
+        # Load and Store behave differently inside of fix_missing_locations;
+        # we don't use them in the vyper AST so just skip adjusting the line
+        # info.
+        if isinstance(node, (python_ast.Load, python_ast.Store)):
+            return super().generic_visit(node)
 
-        if hasattr(node, "last_token"):
-            start_pos = node.first_token.startpos
-            end_pos = node.last_token.endpos
-            if node.last_token.type == 4:
-                # ignore trailing newline once more
-                end_pos -= 1
-            node.src = f"{start_pos}:{end_pos-start_pos}:{self._source_id}"
-            node.node_source_code = self._source_code[start_pos:end_pos]
+        adj = adjustments.get((node.lineno, node.col_offset), 0)
+        node.col_offset += adj
+
+        adj = adjustments.get((node.end_lineno, node.end_col_offset), 0)
+        node.end_col_offset += adj
+
+        start_pos = self.line_offsets[node.lineno] + node.col_offset
+        end_pos = self.line_offsets[node.end_lineno] + node.end_col_offset
+
+        node.src = f"{start_pos}:{end_pos-start_pos}:{self._source_id}"
+        node.node_source_code = self._source_code[start_pos:end_pos]
 
         return super().generic_visit(node)
 
@@ -176,7 +316,11 @@ class AnnotatingVisitor(python_ast.NodeTransformer):
 
         if node.body:
             n = node.body[0]
-            if isinstance(n, python_ast.Expr) and isinstance(n.value, python_ast.Str):
+            if (
+                isinstance(n, python_ast.Expr)
+                and isinstance(n.value, python_ast.Constant)
+                and isinstance(n.value.value, str)
+            ):
                 self.generic_visit(n.value)
                 n.value.ast_type = "DocStr"
                 del node.body[0]
@@ -185,18 +329,15 @@ class AnnotatingVisitor(python_ast.NodeTransformer):
         return node
 
     def visit_Module(self, node):
+        # TODO: is this the best place for these? maybe they can be on
+        # CompilerData instead.
         node.path = self._module_path
         node.resolved_path = self._resolved_path
+        node.source_sha256sum = sha256sum(self._source_code)
         node.source_id = self._source_id
         return self._visit_docstring(node)
 
     def visit_FunctionDef(self, node):
-        if node.decorator_list:
-            # start the source highlight at `def` to improve annotation readability
-            decorator_token = node.decorator_list[-1].last_token
-            def_token = self._tokens.find_token(decorator_token, tokenize.NAME, tok_str="def")
-            node.first_token = def_token
-
         return self._visit_docstring(node)
 
     def visit_ClassDef(self, node):
@@ -209,8 +350,62 @@ class AnnotatingVisitor(python_ast.NodeTransformer):
         """
         self.generic_visit(node)
 
-        node.ast_type = self._modification_offsets[(node.lineno, node.col_offset)]
+        node.ast_type = self._pre_parser.keyword_translations[(node.lineno, node.col_offset)]
         return node
+
+    def visit_For(self, node):
+        """
+        Visit a For node, splicing in the loop variable annotation provided by
+        the pre-parser
+        """
+        key = (node.lineno, node.col_offset)
+        annotation_tokens = self._pre_parser.for_loop_annotations.pop(key)
+
+        if not annotation_tokens:
+            # a common case for people migrating to 0.4.0, provide a more
+            # specific error message than "invalid type annotation"
+            raise SyntaxException(
+                "missing type annotation\n\n"
+                "  (hint: did you mean something like "
+                f"`for {node.target.id}: uint256 in ...`?)",
+                self._source_code,
+                node.lineno,
+                node.col_offset,
+            )
+
+        # some kind of black magic. untokenize preserves the line and column
+        # offsets, giving us something like `\
+        # \
+        # \
+        #   uint8`
+        # that's not a valid python Expr because it is indented.
+        # but it's good because the code is indented to exactly the same
+        # offset as it did in the original source!
+        # (to best understand this, print out annotation_str and
+        # self._source_code and compare them side-by-side).
+        #
+        # what we do here is add in a dummy target which we will remove
+        # in a bit, but for now lets us keep the line/col offset, and
+        # *also* gives us a valid AST. it doesn't matter what the dummy
+        # target name is, since it gets removed in a few lines.
+        annotation_str = tokenize.untokenize(annotation_tokens)
+        annotation_str = "dummy_target:" + annotation_str
+
+        try:
+            fake_node = python_ast.parse(annotation_str).body[0]
+            # do we need to fix location info here?
+            fake_node = _deepcopy_ast(fake_node)
+        except SyntaxError as e:
+            raise SyntaxException(
+                "invalid type annotation", self._source_code, node.lineno, node.col_offset
+            ) from e
+
+        # replace the dummy target name with the real target name.
+        fake_node.target = node.target
+        # replace the For node target with the new ann_assign
+        node.target = fake_node
+
+        return self.generic_visit(node)
 
     def visit_Expr(self, node):
         """
@@ -226,26 +421,45 @@ class AnnotatingVisitor(python_ast.NodeTransformer):
         self.generic_visit(node)
 
         if isinstance(node.value, python_ast.Yield):
+            # CMC 2024-03-03 consider unremoving this from the enclosing Expr
             node = node.value
-            node.ast_type = self._modification_offsets[(node.lineno, node.col_offset)]
+            key = (node.lineno, node.col_offset)
+            node.ast_type = self._pre_parser.keyword_translations[key]
 
         return node
 
-    def visit_Subscript(self, node):
-        """
-        Maintain consistency of `Subscript.slice` across python versions.
-
-        Starting from python 3.9, the `Index` node type has been deprecated,
-        and made impossible to instantiate via regular means. Here we do awful
-        hacky black magic to create an `Index` node. We need our own parser.
-        """
+    def visit_Await(self, node):
+        start_pos = node.lineno, node.col_offset
         self.generic_visit(node)
+        node.ast_type = self._pre_parser.keyword_translations[start_pos]
+        return node
 
-        if not isinstance(node.slice, python_ast.Index):
-            index = python_ast.Constant(value=node.slice, ast_type="Index")
-            index.__class__ = python_ast.Index
-            self.generic_visit(index)
-            node.slice = index
+    def visit_Call(self, node):
+        # Convert structs declared as `Dict` node for vyper < 0.4.0 to kwargs
+        if len(node.args) == 1 and isinstance(node.args[0], python_ast.Dict):
+            msg = "Instantiating a struct using a dictionary is deprecated "
+            msg += "as of v0.4.0 and will be disallowed in a future release. "
+            msg += "Use kwargs instead e.g. Foo(a=1, b=2)"
+
+            # add full_source_code so that str(VyperException(msg, node)) works
+            node.full_source_code = self._source_code
+            vyper_warn(Deprecation(msg, node))
+
+            dict_ = node.args[0]
+            kw_list = []
+
+            assert len(dict_.keys) == len(dict_.values)
+            for key, value in zip(dict_.keys, dict_.values):
+                replacement_kw_node = python_ast.keyword(key.id, value)
+                # set locations
+                for attr in LINE_INFO_FIELDS:
+                    setattr(replacement_kw_node, attr, getattr(key, attr))
+                kw_list.append(replacement_kw_node)
+
+            node.args = []
+            node.keywords = kw_list
+
+        self.generic_visit(node)
 
         return node
 
@@ -264,7 +478,19 @@ class AnnotatingVisitor(python_ast.NodeTransformer):
         if node.value is None or isinstance(node.value, bool):
             node.ast_type = "NameConstant"
         elif isinstance(node.value, str):
-            node.ast_type = "Str"
+            key = (node.lineno, node.col_offset)
+            if key in self._pre_parser.hex_string_locations:
+                if len(node.value) % 2 != 0:
+                    raise SyntaxException(
+                        "Hex string must have an even number of characters",
+                        self._source_code,
+                        node.lineno,
+                        node.col_offset,
+                    )
+                node.ast_type = "HexBytes"
+                self._pre_parser.hex_string_locations.remove(key)
+            else:
+                node.ast_type = "Str"
         elif isinstance(node.value, bytes):
             node.ast_type = "Bytes"
         elif isinstance(node.value, Ellipsis.__class__):
@@ -302,7 +528,7 @@ class AnnotatingVisitor(python_ast.NodeTransformer):
                     node.col_offset,
                 )
             node.ast_type = "Hex"
-            node.n = value
+            node.value = value
 
         elif value.lower()[:2] == "0b":
             node.ast_type = "Bytes"
@@ -316,15 +542,15 @@ class AnnotatingVisitor(python_ast.NodeTransformer):
                 )
             node.value = int(value, 2).to_bytes(len(value) // 8, "big")
 
-        elif isinstance(node.n, float):
+        elif isinstance(node.value, float):
             node.ast_type = "Decimal"
-            node.n = Decimal(value)
+            node.value = Decimal(value)
 
-        elif isinstance(node.n, int):
+        elif isinstance(node.value, int):
             node.ast_type = "Int"
 
-        else:
-            raise CompilerPanic(f"Unexpected type for Constant value: {type(node.n).__name__}")
+        else:  # pragma: nocover
+            raise CompilerPanic(f"Unexpected type for Constant value: {type(node.value).__name__}")
 
         return node
 
@@ -337,54 +563,11 @@ class AnnotatingVisitor(python_ast.NodeTransformer):
         self.generic_visit(node)
 
         is_sub = isinstance(node.op, python_ast.USub)
-        is_num = (
-            hasattr(node.operand, "n")
-            and not isinstance(node.operand.n, bool)
-            and isinstance(node.operand.n, (int, Decimal))
-        )
+        is_num = hasattr(node.operand, "value") and isinstance(node.operand.value, (int, Decimal))
         if is_sub and is_num:
-            node.operand.n = 0 - node.operand.n
+            node.operand.value = 0 - node.operand.value
             node.operand.col_offset = node.col_offset
             node.operand.node_source_code = node.node_source_code
             return node.operand
         else:
             return node
-
-
-def annotate_python_ast(
-    parsed_ast: python_ast.AST,
-    source_code: str,
-    modification_offsets: Optional[ModificationOffsets] = None,
-    source_id: int = 0,
-    module_path: Optional[str] = None,
-    resolved_path: Optional[str] = None,
-) -> python_ast.AST:
-    """
-    Annotate and optimize a Python AST in preparation conversion to a Vyper AST.
-
-    Parameters
-    ----------
-    parsed_ast : AST
-        The AST to be annotated and optimized.
-    source_code : str
-        The originating source code of the AST.
-    modification_offsets : dict, optional
-        A mapping of class names to their original class types.
-
-    Returns
-    -------
-        The annotated and optimized AST.
-    """
-
-    tokens = asttokens.ASTTokens(source_code, tree=cast(Optional[python_ast.Module], parsed_ast))
-    visitor = AnnotatingVisitor(
-        source_code,
-        modification_offsets,
-        tokens,
-        source_id,
-        module_path=module_path,
-        resolved_path=resolved_path,
-    )
-    visitor.visit(parsed_ast)
-
-    return parsed_ast

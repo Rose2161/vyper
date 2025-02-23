@@ -1,7 +1,6 @@
-from decimal import Decimal
-
 import pytest
 
+from tests.utils import decimal_to_int
 from vyper.exceptions import InvalidOperation
 
 
@@ -63,22 +62,17 @@ def bar() -> decimal:
     """
 
     c = get_contract(code)
-    assert c.foo() == Decimal("-18707220957835557353007165858768422651595.9365500927")
-    assert c.bar() == Decimal("18707220957835557353007165858768422651595.9365500927")
+    assert c.foo() == decimal_to_int("-18707220957835557353007165858768422651595.9365500927")
+    assert c.bar() == decimal_to_int("18707220957835557353007165858768422651595.9365500927")
 
 
 def test_negation_int128(get_contract):
     code = """
-a: constant(int128) = -2**127
-
-@external
-def foo() -> int128:
-    return -2**127
+a: constant(int128) = min_value(int128)
 
 @external
 def bar() -> int128:
     return -(a+1)
     """
     c = get_contract(code)
-    assert c.foo() == -(2**127)
     assert c.bar() == 2**127 - 1

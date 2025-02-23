@@ -25,6 +25,36 @@ def foo():
     b: Bytes[1] = b"\x05"
     x: uint256 = as_wei_value(b, "babbage")
     """,
+    """
+@external
+def foo():
+    raw_log(b"cow", b"dog")
+    """,
+    """
+@external
+def foo():
+    xs: uint256[1] = []
+    """,
+    # literal longer than event member
+    """
+event Foo:
+    message: String[1]
+@external
+def foo():
+    log Foo(message="abcd")
+    """,
+    # Address literal must be checksummed
+    """
+a: constant(address) = 0x3cd751e6b0078be393132286c442345e5dc49699
+    """,
+    # test constant folding inside `convert()`
+    """
+BAR: constant(Bytes[5]) = b"vyper"
+
+@external
+def foo():
+    a: Bytes[4] = convert(BAR, Bytes[4])
+    """,
 ]
 
 

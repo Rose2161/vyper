@@ -1,14 +1,25 @@
 import pytest
 
+from tests.ast_utils import deepequals
 from vyper import ast as vy_ast
 from vyper.exceptions import SyntaxException
 
 
 def test_binary_becomes_bytes():
-    expected = vy_ast.parse_to_ast("foo: Bytes[1] = b'\x01'")
-    mutated = vy_ast.parse_to_ast("foo: Bytes[1] = 0b00000001")
+    expected = vy_ast.parse_to_ast(
+        """
+def x():
+    foo: Bytes[1] = b'\x01'
+    """
+    )
+    mutated = vy_ast.parse_to_ast(
+        """
+def x():
+    foo: Bytes[1] = 0b00000001
+    """
+    )
 
-    assert vy_ast.compare_nodes(expected, mutated)
+    assert deepequals(expected, mutated)
 
 
 def test_binary_length():

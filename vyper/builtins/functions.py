@@ -1,7 +1,6 @@
 import hashlib
 import math
 import operator
-from decimal import Decimal
 
 from vyper import ast as vy_ast
 from vyper.abi_types import ABI_Tuple
@@ -9,12 +8,13 @@ from vyper.ast.validation import validate_call_args
 from vyper.codegen.abi_encoder import abi_encode
 from vyper.codegen.context import Context, VariableRecord
 from vyper.codegen.core import (
+    LOAD,
     STORE,
     IRnode,
-    _freshname,
     add_ofst,
     bytes_data_ptr,
     calculate_type_for_external_return,
+    check_buffer_overflow_ir,
     check_external_call,
     clamp,
     clamp2,
@@ -22,13 +22,14 @@ from vyper.codegen.core import (
     clamp_nonzero,
     copy_bytes,
     dummy_node_for_type,
+    ensure_eval_once,
     ensure_in_memory,
-    eval_once_check,
     eval_seq,
     get_bytearray_length,
     get_type_for_exact_size,
     ir_tuple_from_args,
     make_setter,
+    potential_overlap,
     promote_signed_int,
     sar,
     shl,
@@ -38,20 +39,21 @@ from vyper.codegen.core import (
 from vyper.codegen.expr import Expr
 from vyper.codegen.ir_node import Encoding, scope_multi
 from vyper.codegen.keccak256_helper import keccak256_helper
-from vyper.evm.address_space import MEMORY, STORAGE
+from vyper.evm.address_space import MEMORY
+from vyper.evm.opcodes import version_check
 from vyper.exceptions import (
     ArgumentException,
     CompilerPanic,
+    EvmVersionException,
     InvalidLiteral,
     InvalidType,
-    OverflowException,
     StateAccessViolation,
     StructureException,
     TypeMismatch,
     UnfoldableNode,
     ZeroDivisionException,
 )
-from vyper.semantics.analysis.base import VarInfo
+from vyper.semantics.analysis.base import Modifiability, VarInfo
 from vyper.semantics.analysis.utils import (
     get_common_types,
     get_exact_type_from_node,
@@ -88,14 +90,14 @@ from vyper.utils import (
     EIP_170_LIMIT,
     SHA3_PER_WORD,
     MemoryPositions,
-    SizeLimits,
     bytes_to_int,
     ceil32,
     fourbytes_to_int,
     keccak256,
+    method_id,
     method_id_int,
-    vyper_warn,
 )
+from vyper.warnings import vyper_warn
 
 from ._convert import convert
 from ._signatures import BuiltinFunctionT, process_inputs
@@ -108,25 +110,20 @@ SHA256_PER_WORD_GAS = 12
 class FoldedFunctionT(BuiltinFunctionT):
     # Base class for nodes which should always be folded
 
-    # Since foldable builtin functions are not folded before semantics validation,
-    # this flag is used for `check_kwargable` in semantics validation.
-    _kwargable = True
+    _modifiability = Modifiability.CONSTANT
 
 
 class TypenameFoldedFunctionT(FoldedFunctionT):
     # Base class for builtin functions that:
     # (1) take a typename as the only argument; and
     # (2) should always be folded.
-
-    # "TYPE_DEFINITION" is a placeholder value for a type definition string, and
-    # will be replaced by a `TypeTypeDefinition` object in `infer_arg_types`.
-    _inputs = [("typename", "TYPE_DEFINITION")]
+    _inputs = [("typename", TYPE_T.any())]
 
     def fetch_call_return(self, node):
         type_ = self.infer_arg_types(node)[0].typedef
         return type_
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         validate_call_args(node, 1)
         input_typedef = TYPE_T(type_from_annotation(node.args[0]))
         return [input_typedef]
@@ -138,12 +135,13 @@ class Floor(BuiltinFunctionT):
     # TODO: maybe use int136?
     _return_type = INT256_T
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         validate_call_args(node, 1)
-        if not isinstance(node.args[0], vy_ast.Decimal):
+        value = node.args[0].get_folded_value()
+        if not isinstance(value, vy_ast.Decimal):
             raise UnfoldableNode
 
-        value = math.floor(node.args[0].value)
+        value = math.floor(value.value)
         return vy_ast.Int.from_node(node, value=value)
 
     @process_inputs
@@ -168,12 +166,13 @@ class Ceil(BuiltinFunctionT):
     # TODO: maybe use int136?
     _return_type = INT256_T
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         validate_call_args(node, 1)
-        if not isinstance(node.args[0], vy_ast.Decimal):
+        value = node.args[0].get_folded_value()
+        if not isinstance(value, vy_ast.Decimal):
             raise UnfoldableNode
 
-        value = math.ceil(node.args[0].value)
+        value = math.ceil(value.value)
         return vy_ast.Int.from_node(node, value=value)
 
     @process_inputs
@@ -202,7 +201,7 @@ class Convert(BuiltinFunctionT):
         return target_typedef.typedef
 
     # TODO: push this down into convert.py for more consistency
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         validate_call_args(node, 2)
 
         target_type = type_from_annotation(node.args[1])
@@ -241,47 +240,48 @@ def _build_adhoc_slice_node(sub: IRnode, start: IRnode, length: IRnode, context:
 
     dst_typ = BytesT(length.value)
     # allocate a buffer for the return value
-    np = context.new_internal_variable(dst_typ)
+    buf = context.new_internal_variable(dst_typ)
 
-    # `msg.data` by `calldatacopy`
-    if sub.value == "~calldata":
-        node = [
-            "seq",
-            ["assert", ["le", ["add", start, length], "calldatasize"]],  # runtime bounds check
-            ["mstore", np, length],
-            ["calldatacopy", np + 32, start, length],
-            np,
-        ]
-
-    # `self.code` by `codecopy`
-    elif sub.value == "~selfcode":
-        node = [
-            "seq",
-            ["assert", ["le", ["add", start, length], "codesize"]],  # runtime bounds check
-            ["mstore", np, length],
-            ["codecopy", np + 32, start, length],
-            np,
-        ]
-
-    # `<address>.code` by `extcodecopy`
-    else:
-        assert sub.value == "~extcode" and len(sub.args) == 1
-        node = [
-            "with",
-            "_extcode_address",
-            sub.args[0],
-            [
+    with scope_multi((start, length), ("start", "length")) as (b1, (start, length)):
+        # `msg.data` by `calldatacopy`
+        if sub.value == "~calldata":
+            node = [
                 "seq",
-                # runtime bounds check
-                ["assert", ["le", ["add", start, length], ["extcodesize", "_extcode_address"]]],
-                ["mstore", np, length],
-                ["extcodecopy", "_extcode_address", np + 32, start, length],
-                np,
-            ],
-        ]
+                check_buffer_overflow_ir(start, length, "calldatasize"),
+                ["mstore", buf, length],
+                ["calldatacopy", add_ofst(buf, 32), start, length],
+                buf,
+            ]
 
-    assert isinstance(length.value, int)  # mypy hint
-    return IRnode.from_list(node, typ=BytesT(length.value), location=MEMORY)
+        # `self.code` by `codecopy`
+        elif sub.value == "~selfcode":
+            node = [
+                "seq",
+                check_buffer_overflow_ir(start, length, "codesize"),
+                ["mstore", buf, length],
+                ["codecopy", add_ofst(buf, 32), start, length],
+                buf,
+            ]
+
+        # `<address>.code` by `extcodecopy`
+        else:
+            assert sub.value == "~extcode" and len(sub.args) == 1
+            node = [
+                "with",
+                "_extcode_address",
+                sub.args[0],
+                [
+                    "seq",
+                    check_buffer_overflow_ir(start, length, ["extcodesize", "_extcode_address"]),
+                    ["mstore", buf, length],
+                    ["extcodecopy", "_extcode_address", add_ofst(buf, 32), start, length],
+                    buf,
+                ],
+            ]
+
+        assert isinstance(length.value, int)  # mypy hint
+        ret = IRnode.from_list(node, typ=BytesT(length.value), location=MEMORY)
+        return b1.resolve(ret)
 
 
 # note: this and a lot of other builtins could be refactored to accept any uint type
@@ -305,7 +305,7 @@ class Slice(BuiltinFunctionT):
 
         arg = node.args[0]
         start_expr = node.args[1]
-        length_expr = node.args[2]
+        length_expr = node.args[2].reduced()
 
         # CMC 2022-03-22 NOTE slight code duplication with semantics/analysis/local
         is_adhoc_slice = arg.get("attr") == "code" or (
@@ -337,7 +337,7 @@ class Slice(BuiltinFunctionT):
 
         return return_type
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         self._validate_arg_types(node)
         # return a concrete type for `b`
         b_type = get_possible_types_from_node(node.args[0]).pop()
@@ -358,6 +358,9 @@ class Slice(BuiltinFunctionT):
             assert is_bytes32, src
             src = ensure_in_memory(src, context)
 
+        if potential_overlap(src, start) or potential_overlap(src, length):
+            raise CompilerPanic("risky overlap")
+
         with src.cache_when_complex("src") as (b1, src), start.cache_when_complex("start") as (
             b2,
             start,
@@ -373,7 +376,7 @@ class Slice(BuiltinFunctionT):
 
             # add 32 bytes to the buffer size bc word access might
             # be unaligned (see below)
-            if src.location == STORAGE:
+            if src.location.word_addressable:
                 buflen += 32
 
             # Get returntype string or bytes
@@ -400,8 +403,8 @@ class Slice(BuiltinFunctionT):
                 src_data = bytes_data_ptr(src)
 
             # general case. byte-for-byte copy
-            if src.location == STORAGE:
-                # because slice uses byte-addressing but storage
+            if src.location.word_addressable:
+                # because slice uses byte-addressing but storage/tstorage
                 # is word-aligned, this algorithm starts at some number
                 # of bytes before the data section starts, and might copy
                 # an extra word. the pseudocode is:
@@ -446,8 +449,7 @@ class Slice(BuiltinFunctionT):
 
             ret = [
                 "seq",
-                # make sure we don't overrun the source buffer
-                ["assert", ["le", ["add", start, length], src_len]],  # bounds check
+                check_buffer_overflow_ir(start, length, src_len),
                 do_copy,
                 ["mstore", dst, length],  # set length
                 dst,  # return pointer to dst
@@ -461,20 +463,19 @@ class Len(BuiltinFunctionT):
     _inputs = [("b", (StringT.any(), BytesT.any(), DArrayT.any()))]
     _return_type = UINT256_T
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         validate_call_args(node, 1)
-        arg = node.args[0]
+        arg = node.args[0].get_folded_value()
         if isinstance(arg, (vy_ast.Str, vy_ast.Bytes)):
             length = len(arg.value)
         elif isinstance(arg, vy_ast.Hex):
-            # 2 characters represent 1 byte and we subtract 1 to ignore the leading `0x`
-            length = len(arg.value) // 2 - 1
+            length = len(arg.bytes_value)
         else:
             raise UnfoldableNode
 
         return vy_ast.Int.from_node(node, value=length)
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         self._validate_arg_types(node)
         # return a concrete type
         typ = get_possible_types_from_node(node.args[0]).pop()
@@ -504,7 +505,7 @@ class Concat(BuiltinFunctionT):
         return_type.set_length(length)
         return return_type
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         if len(node.args) < 2:
             raise ArgumentException("Invalid argument count: expected at least 2", node)
 
@@ -546,13 +547,10 @@ class Concat(BuiltinFunctionT):
         else:
             ret_typ = BytesT(dst_maxlen)
 
-        # Node representing the position of the output in memory
-        dst = IRnode.from_list(
-            context.new_internal_variable(ret_typ),
-            typ=ret_typ,
-            location=MEMORY,
-            annotation="concat destination",
-        )
+        # respect API of copy_bytes
+        bufsize = dst_maxlen + 32
+        dst = context.new_internal_variable(BytesT(bufsize))
+        dst.annotation = "concat destination"
 
         ret = ["seq"]
         # stack item representing our current offset in the dst buffer
@@ -598,22 +596,22 @@ class Keccak256(BuiltinFunctionT):
     _inputs = [("value", (BytesT.any(), BYTES32_T, StringT.any()))]
     _return_type = BYTES32_T
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         validate_call_args(node, 1)
-        if isinstance(node.args[0], vy_ast.Bytes):
-            value = node.args[0].value
-        elif isinstance(node.args[0], vy_ast.Str):
-            value = node.args[0].value.encode()
-        elif isinstance(node.args[0], vy_ast.Hex):
-            length = len(node.args[0].value) // 2 - 1
-            value = int(node.args[0].value, 16).to_bytes(length, "big")
+        value = node.args[0].get_folded_value()
+        if isinstance(value, vy_ast.Bytes):
+            value = value.value
+        elif isinstance(value, vy_ast.Str):
+            value = value.value.encode()
+        elif isinstance(value, vy_ast.Hex):
+            value = value.bytes_value
         else:
             raise UnfoldableNode
 
         hash_ = f"0x{keccak256(value).hex()}"
         return vy_ast.Hex.from_node(node, value=hash_)
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         self._validate_arg_types(node)
         # return a concrete type for `value`
         value_type = get_possible_types_from_node(node.args[0]).pop()
@@ -645,22 +643,22 @@ class Sha256(BuiltinFunctionT):
     _inputs = [("value", (BYTES32_T, BytesT.any(), StringT.any()))]
     _return_type = BYTES32_T
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         validate_call_args(node, 1)
-        if isinstance(node.args[0], vy_ast.Bytes):
-            value = node.args[0].value
-        elif isinstance(node.args[0], vy_ast.Str):
-            value = node.args[0].value.encode()
-        elif isinstance(node.args[0], vy_ast.Hex):
-            length = len(node.args[0].value) // 2 - 1
-            value = int(node.args[0].value, 16).to_bytes(length, "big")
+        value = node.args[0].get_folded_value()
+        if isinstance(value, vy_ast.Bytes):
+            value = value.value
+        elif isinstance(value, vy_ast.Str):
+            value = value.value.encode()
+        elif isinstance(value, vy_ast.Hex):
+            value = value.bytes_value
         else:
             raise UnfoldableNode
 
         hash_ = f"0x{hashlib.sha256(value).hexdigest()}"
         return vy_ast.Hex.from_node(node, value=hash_)
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         self._validate_arg_types(node)
         # return a concrete type for `value`
         value_type = get_possible_types_from_node(node.args[0]).pop()
@@ -714,42 +712,45 @@ class Sha256(BuiltinFunctionT):
 
 class MethodID(FoldedFunctionT):
     _id = "method_id"
+    _inputs = [("value", StringT.any())]
+    _kwargs = {"output_type": KwargSettings(TYPE_T.any(), BytesT(4))}
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         validate_call_args(node, 1, ["output_type"])
 
-        args = node.args
-        if not isinstance(args[0], vy_ast.Str):
-            raise InvalidType("method id must be given as a literal string", args[0])
-        if " " in args[0].value:
-            raise InvalidLiteral("Invalid function signature - no spaces allowed.")
+        value = node.args[0].get_folded_value()
+        if not isinstance(value, vy_ast.Str):
+            raise InvalidType("method id must be given as a literal string", node.args[0])
+        if " " in value.value:
+            raise InvalidLiteral("Invalid function signature - no spaces allowed.", node.args[0])
 
-        return_type = self.infer_kwarg_types(node)
-        value = method_id_int(args[0].value)
+        return_type = self.infer_kwarg_types(node)["output_type"].typedef
+        value = method_id(value.value)
 
         if return_type.compare_type(BYTES4_T):
-            return vy_ast.Hex.from_node(node, value=hex(value))
+            return vy_ast.Hex.from_node(node, value="0x" + value.hex())
         else:
-            return vy_ast.Bytes.from_node(node, value=value.to_bytes(4, "big"))
+            return vy_ast.Bytes.from_node(node, value=value)
 
     def fetch_call_return(self, node):
         validate_call_args(node, 1, ["output_type"])
 
-        type_ = self.infer_kwarg_types(node)
+        type_ = self.infer_kwarg_types(node)["output_type"].typedef
         return type_
+
+    def infer_arg_types(self, node, expected_return_typ=None):
+        return [self._inputs[0][1]]
 
     def infer_kwarg_types(self, node):
         if node.keywords:
-            return_type = type_from_annotation(node.keywords[0].value)
-            if return_type.compare_type(BYTES4_T):
-                return BYTES4_T
-            elif isinstance(return_type, BytesT) and return_type.length == 4:
-                return BytesT(4)
-            else:
+            output_type = type_from_annotation(node.keywords[0].value)
+            if output_type not in (BytesT(4), BYTES4_T):
                 raise ArgumentException("output_type must be Bytes[4] or bytes4", node.keywords[0])
+        else:
+            # default to `Bytes[4]`
+            output_type = BytesT(4)
 
-        # If `output_type` is not given, default to `Bytes[4]`
-        return BytesT(4)
+        return {"output_type": TYPE_T(output_type)}
 
 
 class ECRecover(BuiltinFunctionT):
@@ -762,7 +763,7 @@ class ECRecover(BuiltinFunctionT):
     ]
     _return_type = AddressT()
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         self._validate_arg_types(node)
         v_t, r_t, s_t = [get_possible_types_from_node(arg).pop() for arg in node.args[1:]]
         return [BYTES32_T, v_t, r_t, s_t]
@@ -777,10 +778,10 @@ class ECRecover(BuiltinFunctionT):
                 # clear output memory first, ecrecover can return 0 bytes
                 ["mstore", output_buf, 0],
                 ["mstore", input_buf, args[0]],
-                ["mstore", input_buf + 32, args[1]],
-                ["mstore", input_buf + 64, args[2]],
-                ["mstore", input_buf + 96, args[3]],
-                ["staticcall", "gas", 1, input_buf, 128, output_buf, 32],
+                ["mstore", add_ofst(input_buf, 32), args[1]],
+                ["mstore", add_ofst(input_buf, 64), args[2]],
+                ["mstore", add_ofst(input_buf, 96), args[3]],
+                ["assert", ["staticcall", "gas", 1, input_buf, 128, output_buf, 32]],
                 ["mload", output_buf],
             ],
             typ=AddressT(),
@@ -793,9 +794,7 @@ class _ECArith(BuiltinFunctionT):
         args_tuple = ir_tuple_from_args(_args)
 
         args_t = args_tuple.typ
-        input_buf = IRnode.from_list(
-            context.new_internal_variable(args_t), typ=args_t, location=MEMORY
-        )
+        input_buf = context.new_internal_variable(args_t)
         ret_t = self._return_type
 
         ret = ["seq"]
@@ -833,33 +832,17 @@ class ECMul(_ECArith):
     _precompile = 0x7
 
 
-def _generic_element_getter(op):
-    def f(index):
-        return IRnode.from_list(
-            [op, ["add", "_sub", ["add", 32, ["mul", 32, index]]]], typ=INT128_T
-        )
-
-    return f
-
-
-def _storage_element_getter(index):
-    return IRnode.from_list(["sload", ["add", "_sub", ["add", 1, index]]], typ=INT128_T)
-
-
 class Extract32(BuiltinFunctionT):
     _id = "extract32"
     _inputs = [("b", BytesT.any()), ("start", IntegerT.unsigneds())]
-    # "TYPE_DEFINITION" is a placeholder value for a type definition string, and
-    # will be replaced by a `TYPE_T` object in `infer_kwarg_types`
-    # (note that it is ignored in _validate_arg_types)
-    _kwargs = {"output_type": KwargSettings("TYPE_DEFINITION", BYTES32_T)}
+    _kwargs = {"output_type": KwargSettings(TYPE_T.any(), BYTES32_T)}
 
     def fetch_call_return(self, node):
         self._validate_arg_types(node)
         return_type = self.infer_kwarg_types(node)["output_type"].typedef
         return return_type
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         self._validate_arg_types(node)
         input_type = get_possible_types_from_node(node.args[0]).pop()
         return [input_type, UINT256_T]
@@ -880,81 +863,50 @@ class Extract32(BuiltinFunctionT):
 
     @process_inputs
     def build_IR(self, expr, args, kwargs, context):
-        sub, index = args
+        bytez, index = args
         ret_type = kwargs["output_type"]
 
-        # Get length and specific element
-        if sub.location == STORAGE:
-            lengetter = IRnode.from_list(["sload", "_sub"], typ=INT128_T)
-            elementgetter = _storage_element_getter
+        if potential_overlap(bytez, index):
+            raise CompilerPanic("risky overlap")
 
-        else:
-            op = sub.location.load_op
-            lengetter = IRnode.from_list([op, "_sub"], typ=INT128_T)
-            elementgetter = _generic_element_getter(op)
+        def finalize(ret):
+            annotation = "extract32"
+            ret = IRnode.from_list(ret, typ=ret_type, annotation=annotation)
+            return clamp_basetype(ret)
 
-        # TODO rewrite all this with cache_when_complex and bitshifts
+        with bytez.cache_when_complex("_sub") as (b1, bytez):
+            # merge
+            length = get_bytearray_length(bytez)
+            index = clamp2(0, index, ["sub", length, 32], signed=True)
+            with index.cache_when_complex("_index") as (b2, index):
+                assert not index.typ.is_signed
 
-        # Special case: index known to be a multiple of 32
-        if isinstance(index.value, int) and not index.value % 32:
-            o = IRnode.from_list(
-                [
-                    "with",
-                    "_sub",
-                    sub,
-                    elementgetter(
-                        ["div", clamp2(0, index, ["sub", lengetter, 32], signed=True), 32]
-                    ),
-                ],
-                typ=ret_type,
-                annotation="extracting 32 bytes",
-            )
-        # General case
-        else:
-            o = IRnode.from_list(
-                [
-                    "with",
-                    "_sub",
-                    sub,
-                    [
-                        "with",
-                        "_len",
-                        lengetter,
-                        [
-                            "with",
-                            "_index",
-                            clamp2(0, index, ["sub", "_len", 32], signed=True),
-                            [
-                                "with",
-                                "_mi32",
-                                ["mod", "_index", 32],
-                                [
-                                    "with",
-                                    "_di32",
-                                    ["div", "_index", 32],
-                                    [
-                                        "if",
-                                        "_mi32",
-                                        [
-                                            "add",
-                                            ["mul", elementgetter("_di32"), ["exp", 256, "_mi32"]],
-                                            [
-                                                "div",
-                                                elementgetter(["add", "_di32", 1]),
-                                                ["exp", 256, ["sub", 32, "_mi32"]],
-                                            ],
-                                        ],
-                                        elementgetter("_di32"),
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-                typ=ret_type,
-                annotation="extract32",
-            )
-        return IRnode.from_list(clamp_basetype(o), typ=ret_type)
+                # "easy" case, byte- addressed locations:
+                if bytez.location.word_scale == 32:
+                    word = LOAD(add_ofst(bytes_data_ptr(bytez), index))
+                    return finalize(b1.resolve(b2.resolve(word)))
+
+                # storage and transient storage, word-addressed
+                assert bytez.location.word_scale == 1
+
+                slot = IRnode.from_list(["div", index, 32])
+                # byte offset within the slot
+                byte_ofst = IRnode.from_list(["mod", index, 32])
+
+                with byte_ofst.cache_when_complex("byte_ofst") as (
+                    b3,
+                    byte_ofst,
+                ), slot.cache_when_complex("slot") as (b4, slot):
+                    # perform two loads and merge
+                    w1 = LOAD(add_ofst(bytes_data_ptr(bytez), slot))
+                    w2 = LOAD(add_ofst(bytes_data_ptr(bytez), ["add", slot, 1]))
+
+                    left_bytes = shl(["mul", 8, byte_ofst], w1)
+                    right_bytes = shr(["mul", 8, ["sub", 32, byte_ofst]], w2)
+                    merged = ["or", left_bytes, right_bytes]
+
+                    ret = ["if", byte_ofst, merged, left_bytes]
+                    return finalize(b1.resolve(b2.resolve(b3.resolve(b4.resolve(ret)))))
 
 
 class AsWeiValue(BuiltinFunctionT):
@@ -974,34 +926,29 @@ class AsWeiValue(BuiltinFunctionT):
     }
 
     def get_denomination(self, node):
-        if not isinstance(node.args[1], vy_ast.Str):
+        value = node.args[1].get_folded_value()
+        if not isinstance(value, vy_ast.Str):
             raise ArgumentException(
                 "Wei denomination must be given as a literal string", node.args[1]
             )
         try:
-            denom = next(v for k, v in self.wei_denoms.items() if node.args[1].value in k)
+            denom = next(v for k, v in self.wei_denoms.items() if value.value in k)
         except StopIteration:
-            raise ArgumentException(
-                f"Unknown denomination: {node.args[1].value}", node.args[1]
-            ) from None
+            raise ArgumentException(f"Unknown denomination: {value.value}", node.args[1]) from None
 
         return denom
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         validate_call_args(node, 2)
         denom = self.get_denomination(node)
 
-        if not isinstance(node.args[0], (vy_ast.Decimal, vy_ast.Int)):
+        value = node.args[0].get_folded_value()
+        if not isinstance(value, (vy_ast.Decimal, vy_ast.Int)):
             raise UnfoldableNode
-        value = node.args[0].value
+        value = value.value
 
         if value < 0:
             raise InvalidLiteral("Negative wei value not allowed", node.args[0])
-
-        if isinstance(value, int) and value >= 2**256:
-            raise InvalidLiteral("Value out of range for uint256", node.args[0])
-        if isinstance(value, Decimal) and value > SizeLimits.MAX_AST_DECIMAL:
-            raise InvalidLiteral("Value out of range for decimal", node.args[0])
 
         return vy_ast.Int.from_node(node, value=int(value * denom))
 
@@ -1009,7 +956,7 @@ class AsWeiValue(BuiltinFunctionT):
         self.infer_arg_types(node)
         return self._return_type
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         self._validate_arg_types(node)
         # return a concrete type instead of abstract type
         value_type = get_possible_types_from_node(node.args[0]).pop()
@@ -1074,8 +1021,14 @@ class RawCall(BuiltinFunctionT):
         kwargz = {i.arg: i.value for i in node.keywords}
 
         outsize = kwargz.get("max_outsize")
+        if outsize is not None:
+            outsize = outsize.get_folded_value()
+
         revert_on_failure = kwargz.get("revert_on_failure")
-        revert_on_failure = revert_on_failure.value if revert_on_failure is not None else True
+        if revert_on_failure is not None:
+            revert_on_failure = revert_on_failure.get_folded_value().value
+        else:
+            revert_on_failure = True
 
         if outsize is None or outsize.value == 0:
             if revert_on_failure:
@@ -1093,7 +1046,7 @@ class RawCall(BuiltinFunctionT):
                 return return_type
             return TupleT([BoolT(), return_type])
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         self._validate_arg_types(node)
         # return a concrete type for `data`
         data_type = get_possible_types_from_node(node.args[1]).pop()
@@ -1114,13 +1067,16 @@ class RawCall(BuiltinFunctionT):
 
         if delegate_call and static_call:
             raise ArgumentException(
-                "Call may use one of `is_delegate_call` or `is_static_call`, not both", expr
+                "Call may use one of `is_delegate_call` or `is_static_call`, not both"
             )
+
+        if (delegate_call or static_call) and value.value != 0:
+            raise ArgumentException("value= may not be passed for static or delegate calls!")
+
         if not static_call and context.is_constant():
             raise StateAccessViolation(
                 f"Cannot make modifying calls from {context.pp_constancy()},"
-                " use `is_static_call=True` to perform this action",
-                expr,
+                " use `is_static_call=True` to perform this action"
             )
 
         if data.value == "~calldata":
@@ -1143,9 +1099,7 @@ class RawCall(BuiltinFunctionT):
             args_ofst = add_ofst(input_buf, 32)
             args_len = ["mload", input_buf]
 
-        output_node = IRnode.from_list(
-            context.new_internal_variable(BytesT(outsize)), typ=BytesT(outsize), location=MEMORY
-        )
+        output_node = context.new_internal_variable(BytesT(outsize))
 
         bool_ty = BoolT()
 
@@ -1167,6 +1121,7 @@ class RawCall(BuiltinFunctionT):
             else:
                 call_op = ["call", gas, to, value, *common_call_args]
 
+            call_op = ensure_eval_once("raw_call_builtin", call_op)
             call_ir += [call_op]
             call_ir = b1.resolve(call_ir)
 
@@ -1223,9 +1178,8 @@ class Send(BuiltinFunctionT):
         to, value = args
         gas = kwargs["gas"]
         context.check_is_not_constant("send ether", expr)
-        return IRnode.from_list(
-            ["assert", ["call", gas, to, value, 0, 0, 0, 0]], error_msg="send failed"
-        )
+        send_op = ensure_eval_once("send_builtin", ["call", gas, to, value, 0, 0, 0, 0])
+        return IRnode.from_list(["assert", send_op], error_msg="send failed")
 
 
 class SelfDestruct(BuiltinFunctionT):
@@ -1237,13 +1191,13 @@ class SelfDestruct(BuiltinFunctionT):
     @process_inputs
     def build_IR(self, expr, args, kwargs, context):
         if not self._warned:
-            vyper_warn("`selfdestruct` is deprecated! The opcode is no longer recommended for use.")
+            vyper_warn(
+                "`selfdestruct` is deprecated! The opcode is no longer recommended for use.", expr
+            )
             self._warned = True
 
         context.check_is_not_constant("selfdestruct", expr)
-        return IRnode.from_list(
-            ["seq", eval_once_check(_freshname("selfdestruct")), ["selfdestruct", args[0]]]
-        )
+        return IRnode.from_list(ensure_eval_once("selfdestruct", ["selfdestruct", args[0]]))
 
 
 class BlockHash(BuiltinFunctionT):
@@ -1259,6 +1213,18 @@ class BlockHash(BuiltinFunctionT):
         )
 
 
+class BlobHash(BuiltinFunctionT):
+    _id = "blobhash"
+    _inputs = [("index", UINT256_T)]
+    _return_type = BYTES32_T
+
+    @process_inputs
+    def build_IR(self, expr, args, kwargs, contact):
+        if not version_check(begin="cancun"):
+            raise EvmVersionException("`blobhash` is not available pre-cancun", expr)
+        return IRnode.from_list(["blobhash", args[0]], typ=BYTES32_T)
+
+
 class RawRevert(BuiltinFunctionT):
     _id = "raw_revert"
     _inputs = [("data", BytesT.any())]
@@ -1268,7 +1234,7 @@ class RawRevert(BuiltinFunctionT):
     def fetch_call_return(self, node):
         return None
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         self._validate_arg_types(node)
         data_type = get_possible_types_from_node(node.args[0]).pop()
         return [data_type]
@@ -1288,10 +1254,11 @@ class RawLog(BuiltinFunctionT):
     def fetch_call_return(self, node):
         self.infer_arg_types(node)
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         self._validate_arg_types(node)
 
-        if not isinstance(node.args[0], vy_ast.List) or len(node.args[0].elements) > 4:
+        arg = node.args[0].reduced()
+        if not isinstance(arg, vy_ast.List) or len(arg.elements) > 4:
             raise InvalidType("Expecting a list of 0-4 topics as first argument", node.args[0])
 
         # return a concrete type for `data`
@@ -1301,35 +1268,30 @@ class RawLog(BuiltinFunctionT):
 
     @process_inputs
     def build_IR(self, expr, args, kwargs, context):
-        topics_length = len(expr.args[0].elements)
+        context.check_is_not_constant(f"use {self._id}", expr)
+
+        topics_length = len(expr.args[0].reduced().elements)
         topics = args[0].args
+        topics = [unwrap_location(topic) for topic in topics]
 
         # sanity check topics is a literal list
         assert args[0].value in ("~empty", "multi")
 
         data = args[1]
 
+        log_op = "log" + str(topics_length)
+
         if data.typ == BYTES32_T:
             placeholder = context.new_internal_variable(BYTES32_T)
+            log_ir = [log_op, placeholder, 32] + topics
             return IRnode.from_list(
-                [
-                    "seq",
-                    # TODO use make_setter
-                    ["mstore", placeholder, unwrap_location(data)],
-                    ["log" + str(topics_length), placeholder, 32] + topics,
-                ]
+                ["seq", make_setter(placeholder, data), ensure_eval_once("raw_log", log_ir)]
             )
 
         input_buf = ensure_in_memory(data, context)
 
-        return IRnode.from_list(
-            [
-                "with",
-                "_sub",
-                input_buf,
-                ["log" + str(topics_length), ["add", "_sub", 32], ["mload", "_sub"], *topics],
-            ]
-        )
+        log_ir = [log_op, ["add", "_sub", 32], ["mload", "_sub"], *topics]
+        return IRnode.from_list(["with", "_sub", input_buf, ensure_eval_once("raw_log", log_ir)])
 
 
 class BitwiseAnd(BuiltinFunctionT):
@@ -1338,19 +1300,18 @@ class BitwiseAnd(BuiltinFunctionT):
     _return_type = UINT256_T
     _warned = False
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         if not self.__class__._warned:
-            vyper_warn("`bitwise_and()` is deprecated! Please use the & operator instead.")
+            vyper_warn("`bitwise_and()` is deprecated! Please use the & operator instead.", node)
             self.__class__._warned = True
 
         validate_call_args(node, 2)
-        for arg in node.args:
-            if not isinstance(arg, vy_ast.Int):
+        values = [i.get_folded_value() for i in node.args]
+        for val in values:
+            if not isinstance(val, vy_ast.Int):
                 raise UnfoldableNode
-            if arg.value < 0 or arg.value >= 2**256:
-                raise InvalidLiteral("Value out of range for uint256", arg)
 
-        value = node.args[0].value & node.args[1].value
+        value = values[0].value & values[1].value
         return vy_ast.Int.from_node(node, value=value)
 
     @process_inputs
@@ -1364,19 +1325,18 @@ class BitwiseOr(BuiltinFunctionT):
     _return_type = UINT256_T
     _warned = False
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         if not self.__class__._warned:
-            vyper_warn("`bitwise_or()` is deprecated! Please use the | operator instead.")
+            vyper_warn("`bitwise_or()` is deprecated! Please use the | operator instead.", node)
             self.__class__._warned = True
 
         validate_call_args(node, 2)
-        for arg in node.args:
-            if not isinstance(arg, vy_ast.Int):
+        values = [i.get_folded_value() for i in node.args]
+        for val in values:
+            if not isinstance(val, vy_ast.Int):
                 raise UnfoldableNode
-            if arg.value < 0 or arg.value >= 2**256:
-                raise InvalidLiteral("Value out of range for uint256", arg)
 
-        value = node.args[0].value | node.args[1].value
+        value = values[0].value | values[1].value
         return vy_ast.Int.from_node(node, value=value)
 
     @process_inputs
@@ -1390,19 +1350,18 @@ class BitwiseXor(BuiltinFunctionT):
     _return_type = UINT256_T
     _warned = False
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         if not self.__class__._warned:
-            vyper_warn("`bitwise_xor()` is deprecated! Please use the ^ operator instead.")
+            vyper_warn("`bitwise_xor()` is deprecated! Please use the ^ operator instead.", node)
             self.__class__._warned = True
 
         validate_call_args(node, 2)
-        for arg in node.args:
-            if not isinstance(arg, vy_ast.Int):
+        values = [i.get_folded_value() for i in node.args]
+        for val in values:
+            if not isinstance(val, vy_ast.Int):
                 raise UnfoldableNode
-            if arg.value < 0 or arg.value >= 2**256:
-                raise InvalidLiteral("Value out of range for uint256", arg)
 
-        value = node.args[0].value ^ node.args[1].value
+        value = values[0].value ^ values[1].value
         return vy_ast.Int.from_node(node, value=value)
 
     @process_inputs
@@ -1416,18 +1375,17 @@ class BitwiseNot(BuiltinFunctionT):
     _return_type = UINT256_T
     _warned = False
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         if not self.__class__._warned:
-            vyper_warn("`bitwise_not()` is deprecated! Please use the ~ operator instead.")
+            vyper_warn("`bitwise_not()` is deprecated! Please use the ~ operator instead.", node)
             self.__class__._warned = True
 
         validate_call_args(node, 1)
-        if not isinstance(node.args[0], vy_ast.Int):
+        value = node.args[0].get_folded_value()
+        if not isinstance(value, vy_ast.Int):
             raise UnfoldableNode
 
-        value = node.args[0].value
-        if value < 0 or value >= 2**256:
-            raise InvalidLiteral("Value out of range for uint256", node.args[0])
+        value = value.value
 
         value = (2**256 - 1) - value
         return vy_ast.Int.from_node(node, value=value)
@@ -1443,17 +1401,16 @@ class Shift(BuiltinFunctionT):
     _return_type = UINT256_T
     _warned = False
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         if not self.__class__._warned:
-            vyper_warn("`shift()` is deprecated! Please use the << or >> operator instead.")
+            vyper_warn("`shift()` is deprecated! Please use the << or >> operator instead.", node)
             self.__class__._warned = True
 
         validate_call_args(node, 2)
-        if [i for i in node.args if not isinstance(i, vy_ast.Int)]:
+        args = [i.get_folded_value() for i in node.args]
+        if any(not isinstance(i, vy_ast.Int) for i in args):
             raise UnfoldableNode
-        value, shift = [i.value for i in node.args]
-        if value < 0 or value >= 2**256:
-            raise InvalidLiteral("Value out of range for uint256", node.args[0])
+        value, shift = [i.value for i in args]
         if shift < -256 or shift > 256:
             # this validation is performed to prevent the compiler from hanging
             # rather than for correctness because the post-folded constant would
@@ -1470,7 +1427,7 @@ class Shift(BuiltinFunctionT):
         # return type is the type of the first argument
         return self.infer_arg_types(node)[0]
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         self._validate_arg_types(node)
         # return a concrete type instead of SignedIntegerAbstractType
         arg_ty = get_possible_types_from_node(node.args[0])[0]
@@ -1495,17 +1452,16 @@ class _AddMulMod(BuiltinFunctionT):
     _inputs = [("a", UINT256_T), ("b", UINT256_T), ("c", UINT256_T)]
     _return_type = UINT256_T
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         validate_call_args(node, 3)
-        if isinstance(node.args[2], vy_ast.Int) and node.args[2].value == 0:
+        args = [i.get_folded_value() for i in node.args]
+        if isinstance(args[2], vy_ast.Int) and args[2].value == 0:
             raise ZeroDivisionException("Modulo by 0", node.args[2])
-        for arg in node.args:
+        for arg in args:
             if not isinstance(arg, vy_ast.Int):
                 raise UnfoldableNode
-            if arg.value < 0 or arg.value >= 2**256:
-                raise InvalidLiteral("Value out of range for uint256", arg)
 
-        value = self._eval_fn(node.args[0].value, node.args[1].value) % node.args[2].value
+        value = self._eval_fn(args[0].value, args[1].value) % args[2].value
         return vy_ast.Int.from_node(node, value=value)
 
     @process_inputs
@@ -1537,15 +1493,13 @@ class PowMod256(BuiltinFunctionT):
     _inputs = [("a", UINT256_T), ("b", UINT256_T)]
     _return_type = UINT256_T
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         validate_call_args(node, 2)
-        if next((i for i in node.args if not isinstance(i, vy_ast.Int)), None):
+        values = [i.get_folded_value() for i in node.args]
+        if any(not isinstance(i, vy_ast.Int) for i in values):
             raise UnfoldableNode
 
-        left, right = node.args
-        if left.value < 0 or right.value < 0:
-            raise UnfoldableNode
-
+        left, right = values
         value = pow(left.value, right.value, 2**256)
         return vy_ast.Int.from_node(node, value=value)
 
@@ -1560,18 +1514,13 @@ class Abs(BuiltinFunctionT):
     _inputs = [("value", INT256_T)]
     _return_type = INT256_T
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         validate_call_args(node, 1)
-        if not isinstance(node.args[0], vy_ast.Int):
+        value = node.args[0].get_folded_value()
+        if not isinstance(value, vy_ast.Int):
             raise UnfoldableNode
 
-        value = node.args[0].value
-        if not SizeLimits.MIN_INT256 <= value <= SizeLimits.MAX_INT256:
-            raise OverflowException("Literal is outside of allowable range for int256")
-        value = abs(value)
-        if not SizeLimits.MIN_INT256 <= value <= SizeLimits.MAX_INT256:
-            raise OverflowException("Absolute literal value is outside allowable range for int256")
-
+        value = abs(value.value)
         return vy_ast.Int.from_node(node, value=value)
 
     def build_IR(self, expr, context):
@@ -1598,18 +1547,16 @@ CREATE2_SENTINEL = dummy_node_for_type(BYTES32_T)
 
 # create helper functions
 # generates CREATE op sequence + zero check for result
-def _create_ir(value, buf, length, salt, checked=True):
+def _create_ir(value, buf, length, salt, revert_on_failure=True):
     args = [value, buf, length]
     create_op = "create"
     if salt is not CREATE2_SENTINEL:
         create_op = "create2"
         args.append(salt)
 
-    ret = IRnode.from_list(
-        ["seq", eval_once_check(_freshname("create_builtin")), [create_op, *args]]
-    )
+    ret = IRnode.from_list(ensure_eval_once("create_builtin", [create_op, *args]))
 
-    if not checked:
+    if not revert_on_failure:
         return ret
 
     ret = clamp_nonzero(ret)
@@ -1710,13 +1657,14 @@ class _CreateBase(BuiltinFunctionT):
     _kwargs = {
         "value": KwargSettings(UINT256_T, zero_value),
         "salt": KwargSettings(BYTES32_T, empty_value),
+        "revert_on_failure": KwargSettings(BoolT(), True, require_literal=True),
     }
     _return_type = AddressT()
 
     @process_inputs
     def build_IR(self, expr, args, kwargs, context):
-        # errmsg something like "Cannot use {self._id} in pure fn"
-        context.check_is_not_constant("use {self._id}", expr)
+        # errmsg something like f"Cannot use {self._id} in pure fn"
+        context.check_is_not_constant(f"use {self._id}", expr)
 
         should_use_create2 = "salt" in [kwarg.arg for kwarg in expr.keywords]
 
@@ -1743,7 +1691,7 @@ class CreateMinimalProxyTo(_CreateBase):
         bytecode_len = 20 + len(b) + len(c)
         return _create_addl_gas_estimate(bytecode_len, should_use_create2)
 
-    def _build_create_IR(self, expr, args, context, value, salt):
+    def _build_create_IR(self, expr, args, context, value, salt, revert_on_failure):
         target_address = args[0]
 
         buf = context.new_internal_variable(BytesT(96))
@@ -1769,9 +1717,9 @@ class CreateMinimalProxyTo(_CreateBase):
         return [
             "seq",
             ["mstore", buf, forwarder_preamble],
-            ["mstore", ["add", buf, preamble_length], aligned_target],
-            ["mstore", ["add", buf, preamble_length + 20], forwarder_post],
-            _create_ir(value, buf, buf_len, salt=salt),
+            ["mstore", add_ofst(buf, preamble_length), aligned_target],
+            ["mstore", add_ofst(buf, preamble_length + 20), forwarder_post],
+            _create_ir(value, buf, buf_len, salt, revert_on_failure),
         ]
 
 
@@ -1780,7 +1728,9 @@ class CreateForwarderTo(CreateMinimalProxyTo):
 
     def build_IR(self, expr, context):
         if not self._warned:
-            vyper_warn("`create_forwarder_to` is a deprecated alias of `create_minimal_proxy_to`!")
+            vyper_warn(
+                "`create_forwarder_to` is a deprecated alias of `create_minimal_proxy_to`!", expr
+            )
             self._warned = True
 
         return super().build_IR(expr, context)
@@ -1798,7 +1748,7 @@ class CreateCopyOf(_CreateBase):
         # max possible runtime length + preamble length
         return _create_addl_gas_estimate(EIP_170_LIMIT + self._preamble_len, should_use_create2)
 
-    def _build_create_IR(self, expr, args, context, value, salt):
+    def _build_create_IR(self, expr, args, context, value, salt, revert_on_failure):
         target = args[0]
 
         # something we can pass to scope_multi
@@ -1832,7 +1782,7 @@ class CreateCopyOf(_CreateBase):
                 buf = add_ofst(mem_ofst, 32 - preamble_len)
                 buf_len = ["add", codesize, preamble_len]
 
-                ir.append(_create_ir(value, buf, buf_len, salt))
+                ir.append(_create_ir(value, buf, buf_len, salt, revert_on_failure))
 
                 return b1.resolve(b2.resolve(ir))
 
@@ -1844,7 +1794,8 @@ class CreateFromBlueprint(_CreateBase):
         "value": KwargSettings(UINT256_T, zero_value),
         "salt": KwargSettings(BYTES32_T, empty_value),
         "raw_args": KwargSettings(BoolT(), False, require_literal=True),
-        "code_offset": KwargSettings(UINT256_T, zero_value),
+        "code_offset": KwargSettings(UINT256_T, IRnode.from_list(3, typ=UINT256_T)),
+        "revert_on_failure": KwargSettings(BoolT(), True, require_literal=True),
     }
     _has_varargs = True
 
@@ -1854,7 +1805,9 @@ class CreateFromBlueprint(_CreateBase):
         maxlen = EIP_170_LIMIT + ctor_args.typ.abi_type.size_bound()
         return _create_addl_gas_estimate(maxlen, should_use_create2)
 
-    def _build_create_IR(self, expr, args, context, value, salt, code_offset, raw_args):
+    def _build_create_IR(
+        self, expr, args, context, value, salt, code_offset, raw_args, revert_on_failure
+    ):
         target = args[0]
         ctor_args = args[1:]
 
@@ -1864,9 +1817,15 @@ class CreateFromBlueprint(_CreateBase):
             if len(ctor_args) != 1 or not isinstance(ctor_args[0].typ, BytesT):
                 raise StructureException("raw_args must be used with exactly 1 bytes argument")
 
-            argbuf = bytes_data_ptr(ctor_args[0])
-            argslen = get_bytearray_length(ctor_args[0])
-            bufsz = ctor_args[0].typ.maxlen
+            with ctor_args[0].cache_when_complex("arg") as (b1, arg):
+                argbuf = bytes_data_ptr(arg)
+                argslen = get_bytearray_length(arg)
+                bufsz = arg.typ.maxlen
+                return b1.resolve(
+                    self._helper(
+                        argbuf, bufsz, target, value, salt, argslen, code_offset, revert_on_failure
+                    )
+                )
         else:
             # encode the varargs
             to_encode = ir_tuple_from_args(ctor_args)
@@ -1874,14 +1833,16 @@ class CreateFromBlueprint(_CreateBase):
             # pretend we allocated enough memory for the encoder
             # (we didn't, but we are clobbering unused memory so it's safe.)
             bufsz = to_encode.typ.abi_type.size_bound()
-            argbuf = IRnode.from_list(
-                context.new_internal_variable(get_type_for_exact_size(bufsz)), location=MEMORY
-            )
+            argbuf = context.new_internal_variable(get_type_for_exact_size(bufsz))
 
             # return a complex expression which writes to memory and returns
             # the length of the encoded data
             argslen = abi_encode(argbuf, to_encode, context, bufsz=bufsz, returns_len=True)
+            return self._helper(
+                argbuf, bufsz, target, value, salt, argslen, code_offset, revert_on_failure
+            )
 
+    def _helper(self, argbuf, bufsz, target, value, salt, argslen, code_offset, revert_on_failure):
         # NOTE: we need to invoke the abi encoder before evaluating MSIZE,
         # then copy the abi encoded buffer to past-the-end of the initcode
         # (since the abi encoder could write to fresh memory).
@@ -1930,7 +1891,7 @@ class CreateFromBlueprint(_CreateBase):
 
                 length = ["add", codesize, encoded_args_len]
 
-                ir.append(_create_ir(value, mem_ofst, length, salt))
+                ir.append(_create_ir(value, mem_ofst, length, salt, revert_on_failure))
 
                 return b1.resolve(b2.resolve(ir))
 
@@ -1946,7 +1907,7 @@ class _UnsafeMath(BuiltinFunctionT):
         return_type = self.infer_arg_types(node).pop()
         return return_type
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         self._validate_arg_types(node)
 
         types_list = get_common_types(*node.args, filter_fn=lambda x: isinstance(x, IntegerT))
@@ -1986,52 +1947,48 @@ class _UnsafeMath(BuiltinFunctionT):
 
 
 class UnsafeAdd(_UnsafeMath):
+    _id = "unsafe_add"
     op = "add"
 
 
 class UnsafeSub(_UnsafeMath):
+    _id = "unsafe_sub"
     op = "sub"
 
 
 class UnsafeMul(_UnsafeMath):
+    _id = "unsafe_mul"
     op = "mul"
 
 
 class UnsafeDiv(_UnsafeMath):
+    _id = "unsafe_div"
     op = "div"
 
 
 class _MinMax(BuiltinFunctionT):
     _inputs = [("a", (DecimalT(), IntegerT.any())), ("b", (DecimalT(), IntegerT.any()))]
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         validate_call_args(node, 2)
-        if not isinstance(node.args[0], type(node.args[1])):
-            raise UnfoldableNode
-        if not isinstance(node.args[0], (vy_ast.Decimal, vy_ast.Int)):
-            raise UnfoldableNode
 
-        left, right = (i.value for i in node.args)
-        if isinstance(left, Decimal) and (
-            min(left, right) < SizeLimits.MIN_AST_DECIMAL
-            or max(left, right) > SizeLimits.MAX_AST_DECIMAL
-        ):
-            raise InvalidType("Decimal value is outside of allowable range", node)
+        left = node.args[0].get_folded_value()
+        right = node.args[1].get_folded_value()
+        if not isinstance(left, type(right)):
+            raise UnfoldableNode
+        if not isinstance(left, (vy_ast.Decimal, vy_ast.Int)):
+            raise UnfoldableNode
 
         types_list = get_common_types(
-            *node.args, filter_fn=lambda x: isinstance(x, (IntegerT, DecimalT))
+            *(left, right), filter_fn=lambda x: isinstance(x, (IntegerT, DecimalT))
         )
         if not types_list:
             raise TypeMismatch("Cannot perform action between dislike numeric types", node)
 
-        value = self._eval_fn(left, right)
-        return type(node.args[0]).from_node(node, value=value)
+        value = self._eval_fn(left.value, right.value)
+        return type(left).from_node(node, value=value)
 
     def fetch_call_return(self, node):
-        return_type = self.infer_arg_types(node).pop()
-        return return_type
-
-    def infer_arg_types(self, node):
         self._validate_arg_types(node)
 
         types_list = get_common_types(
@@ -2040,8 +1997,13 @@ class _MinMax(BuiltinFunctionT):
         if not types_list:
             raise TypeMismatch("Cannot perform action between dislike numeric types", node)
 
-        type_ = types_list.pop()
-        return [type_, type_]
+        return types_list
+
+    def infer_arg_types(self, node, expected_return_typ=None):
+        types_list = self.fetch_call_return(node)
+        # type mismatch should have been caught in `fetch_call_return`
+        assert expected_return_typ in types_list
+        return [expected_return_typ, expected_return_typ]
 
     @process_inputs
     def build_IR(self, expr, args, kwargs, context):
@@ -2085,18 +2047,19 @@ class Uint2Str(BuiltinFunctionT):
         len_needed = math.ceil(bits * math.log(2) / math.log(10))
         return StringT(len_needed)
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         validate_call_args(node, 1)
-        if not isinstance(node.args[0], vy_ast.Int):
+        value = node.args[0].get_folded_value()
+        if not isinstance(value, vy_ast.Int):
             raise UnfoldableNode
 
-        value = node.args[0].value
+        value = value.value
         if value < 0:
             raise InvalidType("Only unsigned ints allowed", node)
         value = str(value)
         return vy_ast.Str.from_node(node, value=value)
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         self._validate_arg_types(node)
         input_type = get_possible_types_from_node(node.args[0]).pop()
         return [input_type]
@@ -2121,13 +2084,17 @@ class Uint2Str(BuiltinFunctionT):
                     # clobber val, and return it as a pointer
                     [
                         "seq",
-                        ["mstore", ["sub", buf + n_digits, i], i],
-                        ["set", val, ["sub", buf + n_digits, i]],
+                        ["mstore", ["sub", add_ofst(buf, n_digits), i], i],
+                        ["set", val, ["sub", add_ofst(buf, n_digits), i]],
                         "break",
                     ],
                     [
                         "seq",
-                        ["mstore", ["sub", buf + n_digits, i], ["add", 48, ["mod", val, 10]]],
+                        [
+                            "mstore",
+                            ["sub", add_ofst(buf, n_digits), i],
+                            ["add", 48, ["mod", val, 10]],
+                        ],
                         ["set", val, ["div", val, 10]],
                     ],
                 ],
@@ -2143,7 +2110,7 @@ class Uint2Str(BuiltinFunctionT):
             ret = [
                 "if",
                 ["eq", val, 0],
-                ["seq", ["mstore", buf + 1, ord("0")], ["mstore", buf, 1], buf],
+                ["seq", ["mstore", add_ofst(buf, 1), ord("0")], ["mstore", buf, 1], buf],
                 ["seq", ret, val],
             ]
 
@@ -2162,7 +2129,8 @@ class Sqrt(BuiltinFunctionT):
 
         arg = args[0]
         # TODO: reify decimal and integer sqrt paths (see isqrt)
-        sqrt_code = """
+        with arg.cache_when_complex("x") as (b1, arg):
+            sqrt_code = """
 assert x >= 0.0
 z: decimal = 0.0
 
@@ -2172,38 +2140,41 @@ else:
     z = x / 2.0 + 0.5
     y: decimal = x
 
-    for i in range(256):
+    for i: uint256 in range(256):
         if z == y:
             break
         y = z
         z = (x / z + z) / 2.0
-        """
 
-        x_type = DecimalT()
-        placeholder_copy = ["pass"]
-        # Steal current position if variable is already allocated.
-        if arg.value == "mload":
-            new_var_pos = arg.args[0]
-        # Other locations need to be copied.
-        else:
-            new_var_pos = context.new_internal_variable(x_type)
-            placeholder_copy = ["mstore", new_var_pos, arg]
-        # Create input variables.
-        variables = {"x": VariableRecord(name="x", pos=new_var_pos, typ=x_type, mutable=False)}
-        # Dictionary to update new (i.e. typecheck) namespace
-        variables_2 = {"x": VarInfo(DecimalT())}
-        # Generate inline IR.
-        new_ctx, sqrt_ir = generate_inline_function(
-            code=sqrt_code,
-            variables=variables,
-            variables_2=variables_2,
-            memory_allocator=context.memory_allocator,
-        )
-        return IRnode.from_list(
-            ["seq", placeholder_copy, sqrt_ir, new_ctx.vars["z"].pos],  # load x variable
-            typ=DecimalT(),
-            location=MEMORY,
-        )
+    if y < z:
+        z = y
+            """
+
+            x_type = DecimalT()
+            placeholder_copy = ["pass"]
+            # Steal current position if variable is already allocated.
+            if arg.value == "mload":
+                new_var_pos = arg.args[0]
+            # Other locations need to be copied.
+            else:
+                new_var_pos = context.new_internal_variable(x_type)
+                placeholder_copy = ["mstore", new_var_pos, arg]
+            # Create input variables.
+            variables = {"x": VariableRecord(name="x", pos=new_var_pos, typ=x_type, mutable=False)}
+            # Dictionary to update new (i.e. typecheck) namespace
+            variables_2 = {"x": VarInfo(DecimalT())}
+            # Generate inline IR.
+            new_ctx, sqrt_ir = generate_inline_function(
+                code=sqrt_code,
+                variables=variables,
+                variables_2=variables_2,
+                memory_allocator=context.memory_allocator,
+            )
+            z_ir = new_ctx.vars["z"].as_ir_node()
+            ret = IRnode.from_list(
+                ["seq", placeholder_copy, sqrt_ir, z_ir], typ=DecimalT(), location=MEMORY
+            )
+            return b1.resolve(ret)
 
 
 class ISqrt(BuiltinFunctionT):
@@ -2279,7 +2250,7 @@ class Breakpoint(BuiltinFunctionT):
 
     def fetch_call_return(self, node):
         if not self._warned:
-            vyper_warn("`breakpoint` should only be used for debugging!\n" + node._annotated_source)
+            vyper_warn("`breakpoint` should only be used for debugging!", node)
             self._warned = True
 
         return None
@@ -2299,7 +2270,7 @@ class Print(BuiltinFunctionT):
 
     def fetch_call_return(self, node):
         if not self._warned:
-            vyper_warn("`print` should only be used for debugging!\n" + node._annotated_source)
+            vyper_warn("`print` should only be used for debugging!", node)
             self._warned = True
 
         return None
@@ -2321,21 +2292,16 @@ class Print(BuiltinFunctionT):
 
             ret = ["seq"]
             ret.append(["mstore", buf, method_id])
-            encode = abi_encode(buf + 32, args_as_tuple, context, buflen, returns_len=True)
+            encode = abi_encode(add_ofst(buf, 32), args_as_tuple, context, buflen, returns_len=True)
 
         else:
             method_id = method_id_int("log(string,bytes)")
+
             schema = args_abi_t.selector_name().encode("utf-8")
-            if len(schema) > 32:
-                raise CompilerPanic("print signature too long: {schema}")
-
             schema_t = StringT(len(schema))
-            schema_buf = context.new_internal_variable(schema_t)
-            ret = ["seq"]
-            ret.append(["mstore", schema_buf, len(schema)])
+            schema_buf = Expr._make_bytelike(context, StringT, schema)
 
-            # TODO use Expr.make_bytelike, or better have a `bytestring` IRnode type
-            ret.append(["mstore", schema_buf + 32, bytes_to_int(schema.ljust(32, b"\x00"))])
+            ret = ["seq"]
 
             payload_buflen = args_abi_t.size_bound()
             payload_t = BytesT(payload_buflen)
@@ -2343,7 +2309,7 @@ class Print(BuiltinFunctionT):
             # 32 bytes extra space for the method id
             payload_buf = context.new_internal_variable(payload_t)
             encode_payload = abi_encode(
-                payload_buf + 32, args_as_tuple, context, payload_buflen, returns_len=True
+                add_ofst(payload_buf, 32), args_as_tuple, context, payload_buflen, returns_len=True
             )
 
             ret.append(["mstore", payload_buf, encode_payload])
@@ -2358,17 +2324,19 @@ class Print(BuiltinFunctionT):
             buflen = 32 + args_as_tuple.typ.abi_type.size_bound()
             buf = context.new_internal_variable(get_type_for_exact_size(buflen))
             ret.append(["mstore", buf, method_id])
-            encode = abi_encode(buf + 32, args_as_tuple, context, buflen, returns_len=True)
+            encode = abi_encode(add_ofst(buf, 32), args_as_tuple, context, buflen, returns_len=True)
 
         # debug address that tooling uses
         CONSOLE_ADDRESS = 0x000000000000000000636F6E736F6C652E6C6F67
-        ret.append(["staticcall", "gas", CONSOLE_ADDRESS, buf + 28, ["add", 4, encode], 0, 0])
+        ret.append(
+            ["staticcall", "gas", CONSOLE_ADDRESS, add_ofst(buf, 28), ["add", 4, encode], 0, 0]
+        )
 
         return IRnode.from_list(ret, annotation="print:" + sig)
 
 
 class ABIEncode(BuiltinFunctionT):
-    _id = "_abi_encode"  # TODO prettier to rename this to abi.encode
+    _id = "abi_encode"
     # signature: *, ensure_tuple=<literal_bool> -> Bytes[<calculated len>]
     # explanation of ensure_tuple:
     # default is to force even a single value into a tuple,
@@ -2391,7 +2359,13 @@ class ABIEncode(BuiltinFunctionT):
         for kwarg in node.keywords:
             kwarg_name = kwarg.arg
             validate_expected_type(kwarg.value, self._kwargs[kwarg_name].typ)
-            ret[kwarg_name] = get_exact_type_from_node(kwarg.value)
+
+            typ = get_exact_type_from_node(kwarg.value)
+            if kwarg_name == "method_id" and isinstance(typ, BytesT):
+                if typ.length != 4:
+                    raise InvalidLiteral("method_id must be exactly 4 bytes!", kwarg.value)
+
+            ret[kwarg_name] = typ
         return ret
 
     def fetch_call_return(self, node):
@@ -2465,15 +2439,19 @@ class ABIEncode(BuiltinFunctionT):
             # <32 bytes length> | <4 bytes method_id> | <everything else>
             # write the unaligned method_id first, then we will
             # overwrite the 28 bytes of zeros with the bytestring length
-            ret += [["mstore", buf + 4, method_id]]
+            ret += [["mstore", add_ofst(buf, 4), method_id]]
             # abi encode, and grab length as stack item
-            length = abi_encode(buf + 36, encode_input, context, returns_len=True, bufsz=maxlen)
+            length = abi_encode(
+                add_ofst(buf, 36), encode_input, context, returns_len=True, bufsz=maxlen
+            )
             # write the output length to where bytestring stores its length
             ret += [["mstore", buf, ["add", length, 4]]]
 
         else:
             # abi encode and grab length as stack item
-            length = abi_encode(buf + 32, encode_input, context, returns_len=True, bufsz=maxlen)
+            length = abi_encode(
+                add_ofst(buf, 32), encode_input, context, returns_len=True, bufsz=maxlen
+            )
             # write the output length to where bytestring stores its length
             ret += [["mstore", buf, length]]
 
@@ -2485,15 +2463,15 @@ class ABIEncode(BuiltinFunctionT):
 
 
 class ABIDecode(BuiltinFunctionT):
-    _id = "_abi_decode"
-    _inputs = [("data", BytesT.any()), ("output_type", "TYPE_DEFINITION")]
+    _id = "abi_decode"
+    _inputs = [("data", BytesT.any()), ("output_type", TYPE_T.any())]
     _kwargs = {"unwrap_tuple": KwargSettings(BoolT(), True, require_literal=True)}
 
     def fetch_call_return(self, node):
         _, output_type = self.infer_arg_types(node)
         return output_type.typedef
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         self._validate_arg_types(node)
 
         validate_call_args(node, 2, ["unwrap_tuple"])
@@ -2515,7 +2493,7 @@ class ABIDecode(BuiltinFunctionT):
             wrapped_typ = calculate_type_for_external_return(output_typ)
 
         abi_size_bound = wrapped_typ.abi_type.size_bound()
-        abi_min_size = wrapped_typ.abi_type.min_size()
+        abi_min_size = wrapped_typ.abi_type.static_size()
 
         # Get the size of data
         input_max_len = data.typ.maxlen
@@ -2539,6 +2517,10 @@ class ABIDecode(BuiltinFunctionT):
 
             ret = ["seq"]
 
+            # NOTE: we could replace these 4 lines with
+            # `[assert [le, abi_min_size, data_len]]`. it depends on
+            # what we consider a "valid" payload.
+            # cf. test_abi_decode_max_size()
             if abi_min_size == abi_size_bound:
                 ret.append(["assert", ["eq", abi_min_size, data_len]])
             else:
@@ -2558,21 +2540,46 @@ class ABIDecode(BuiltinFunctionT):
             # input validation
 
             output_buf = context.new_internal_variable(wrapped_typ)
-            output = IRnode.from_list(output_buf, typ=wrapped_typ, location=MEMORY)
 
             # sanity check buffer size for wrapped output type will not buffer overflow
             assert wrapped_typ.memory_bytes_required == output_typ.memory_bytes_required
-            ret.append(make_setter(output, to_decode))
 
-            ret.append(output)
+            # pass a buffer bound to make_setter so appropriate oob
+            # validation is performed
+            buf_bound = add_ofst(data_ptr, data_len)
+            ret.append(make_setter(output_buf, to_decode, hi=buf_bound))
+
+            ret.append(output_buf)
             # finalize. set the type and location for the return buffer.
             # (note: unwraps the tuple type if necessary)
             ret = IRnode.from_list(ret, typ=output_typ, location=MEMORY)
             return b1.resolve(ret)
 
 
+class OldABIEncode(ABIEncode):
+    _warned = False
+    _id = "_abi_encode"
+
+    def _try_fold(self, node):
+        if not self.__class__._warned:
+            vyper_warn(f"`{self._id}()` is deprecated! Please use `{super()._id}()` instead.", node)
+            self.__class__._warned = True
+        super()._try_fold(node)
+
+
+class OldABIDecode(ABIDecode):
+    _warned = False
+    _id = "_abi_decode"
+
+    def _try_fold(self, node):
+        if not self.__class__._warned:
+            vyper_warn(f"`{self._id}()` is deprecated! Please use `{super()._id}()` instead.", node)
+            self.__class__._warned = True
+        super()._try_fold(node)
+
+
 class _MinMaxValue(TypenameFoldedFunctionT):
-    def evaluate(self, node):
+    def _try_fold(self, node):
         self._validate_arg_types(node)
         input_type = type_from_annotation(node.args[0])
 
@@ -2589,6 +2596,10 @@ class _MinMaxValue(TypenameFoldedFunctionT):
 
         ret._metadata["type"] = input_type
         return ret
+
+    def infer_arg_types(self, node, expected_return_typ=None):
+        input_typedef = TYPE_T(type_from_annotation(node.args[0]))
+        return [input_typedef]
 
 
 class MinValue(_MinMaxValue):
@@ -2608,7 +2619,7 @@ class MaxValue(_MinMaxValue):
 class Epsilon(TypenameFoldedFunctionT):
     _id = "epsilon"
 
-    def evaluate(self, node):
+    def _try_fold(self, node):
         self._validate_arg_types(node)
         input_type = type_from_annotation(node.args[0])
 
@@ -2619,8 +2630,10 @@ class Epsilon(TypenameFoldedFunctionT):
 
 
 DISPATCH_TABLE = {
-    "_abi_encode": ABIEncode(),
-    "_abi_decode": ABIDecode(),
+    "abi_encode": ABIEncode(),
+    "abi_decode": ABIDecode(),
+    "_abi_encode": OldABIEncode(),
+    "_abi_decode": OldABIDecode(),
     "floor": Floor(),
     "ceil": Ceil(),
     "convert": Convert(),
@@ -2637,6 +2650,7 @@ DISPATCH_TABLE = {
     "as_wei_value": AsWeiValue(),
     "raw_call": RawCall(),
     "blockhash": BlockHash(),
+    "blobhash": BlobHash(),
     "bitwise_and": BitwiseAnd(),
     "bitwise_or": BitwiseOr(),
     "bitwise_xor": BitwiseXor(),

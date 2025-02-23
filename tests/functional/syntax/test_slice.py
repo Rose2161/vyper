@@ -1,7 +1,7 @@
 import pytest
 
 from vyper import compiler
-from vyper.exceptions import InvalidType, TypeMismatch
+from vyper.exceptions import TypeMismatch
 
 fail_list = [
     (
@@ -26,7 +26,7 @@ def foo(inp: int128) -> Bytes[3]:
 def foo(inp: Bytes[10]) -> Bytes[3]:
     return slice(inp, 4.0, 3)
     """,
-        InvalidType,
+        TypeMismatch,
     ),
 ]
 
@@ -52,6 +52,22 @@ def foo(inp: Bytes[10]) -> Bytes[4]:
 @external
 def foo() -> Bytes[10]:
     return slice(b"badmintonzzz", 1, 10)
+    """,
+    # test constant folding for `slice()` `length` argument
+    """
+@external
+def foo():
+    x: Bytes[32] = slice(msg.data, 0, 31 + 1)
+    """,
+    """
+@external
+def foo(a: address):
+    x: Bytes[32] = slice(a.code, 0, 31 + 1)
+    """,
+    """
+@external
+def foo(inp: Bytes[5], start: uint256) -> Bytes[3]:
+    return slice(inp, 0, 1 + 1)
     """,
 ]
 
