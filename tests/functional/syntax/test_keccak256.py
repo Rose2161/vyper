@@ -1,20 +1,18 @@
 import pytest
 
 from vyper import compiler
-from vyper.exceptions import InvalidType, UndeclaredDefinition
+from vyper.exceptions import TypeMismatch, UndeclaredDefinition
 
-type_fail_list = [
-    """
+type_fail_list = ["""
 @external
 def foo():
     x: bytes32 = keccak256(3)
-    """
-]
+    """]
 
 
 @pytest.mark.parametrize("bad_code", type_fail_list)
 def test_block_type_fail(bad_code):
-    with pytest.raises(InvalidType):
+    with pytest.raises(TypeMismatch):
         compiler.compile_code(bad_code)
 
 

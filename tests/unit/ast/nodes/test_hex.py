@@ -1,7 +1,7 @@
 import pytest
 
+from tests.utils import analyze_module_single
 from vyper import ast as vy_ast
-from vyper import semantics
 from vyper.exceptions import InvalidLiteral
 
 code_invalid_checksum = [
@@ -24,22 +24,20 @@ def foo():
     """
 @external
 def foo():
-    for i in [0x6b175474e89094c44da98b954eedeac495271d0F]:
+    for i: address in [0x6b175474e89094c44da98b954eedeac495271d0F]:
         pass
     """,
     """
 foo: constant(bytes20) = 0x6b175474e89094c44da98b954eedeac495271d0F
     """,
     """
-foo: constant(bytes4) = 0x12_34_56
+foo: constant(bytes4) = 0X12345678
     """,
 ]
 
 
 @pytest.mark.parametrize("code", code_invalid_checksum)
-def test_invalid_checksum(code, dummy_input_bundle):
-    vyper_module = vy_ast.parse_to_ast(code)
-
+def test_invalid_checksum(code):
     with pytest.raises(InvalidLiteral):
-        vy_ast.validation.validate_literal_nodes(vyper_module)
-        semantics.validate_semantics(vyper_module, dummy_input_bundle)
+        vyper_module = vy_ast.parse_to_ast(code)
+        analyze_module_single(vyper_module)

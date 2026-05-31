@@ -5,6 +5,7 @@ from copy import deepcopy
 
 import pytest
 
+import vyper
 from vyper.cli.vyper_json import _parse_args
 from vyper.exceptions import JSONError
 
@@ -13,7 +14,7 @@ import contracts.ibar as IBar
 
 @external
 def foo(a: address) -> bool:
-    return IBar(a).bar(1)
+    return extcall IBar(a).bar(1)
 """
 
 BAR_CODE = """
@@ -99,3 +100,12 @@ def test_traceback(tmp_path, capfd):
     assert not _no_errors(output_json)
     with pytest.raises(JSONError):
         _parse_args([path.absolute().as_posix(), "--traceback"])
+
+
+def test_version(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        _parse_args(["--version"])
+
+    assert exc_info.value.code == 0
+    captured = capsys.readouterr()
+    assert vyper.__long_version__ in captured.out

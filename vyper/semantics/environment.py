@@ -1,7 +1,8 @@
 from typing import Dict
 
-from vyper.semantics.analysis.base import VarInfo
-from vyper.semantics.types import AddressT, BytesT, VyperType
+from vyper.semantics.analysis.base import Modifiability, VarInfo
+from vyper.semantics.types import AddressT, BytesT, SelfT, VyperType
+from vyper.semantics.types.infinity import INF
 from vyper.semantics.types.shortcuts import BYTES32_T, UINT256_T
 
 
@@ -19,10 +20,11 @@ class _Block(_EnvType):
     _type_members = {
         "coinbase": AddressT(),
         "difficulty": UINT256_T,
-        "prevrandao": UINT256_T,
+        "prevrandao": BYTES32_T,
         "number": UINT256_T,
         "gaslimit": UINT256_T,
         "basefee": UINT256_T,
+        "blobbasefee": UINT256_T,
         "prevhash": BYTES32_T,
         "timestamp": UINT256_T,
     }
@@ -35,7 +37,22 @@ class _Chain(_EnvType):
 
 class _Msg(_EnvType):
     _id = "msg"
-    _type_members = {"data": BytesT(), "gas": UINT256_T, "sender": AddressT(), "value": UINT256_T}
+    _type_members = {
+        "data": BytesT(INF),
+        "gas": UINT256_T,
+        "mana": UINT256_T,
+        "sender": AddressT(),
+        "value": UINT256_T,
+    }
+
+
+# TODO: Is more of a built-in Constant, and should be Modifiability.CONSTANT
+class _Inf(_EnvType):
+    _id = "INF"
+
+
+# TODO: Remove, see other todos
+_inf = _Inf()
 
 
 class _Tx(_EnvType):
@@ -43,21 +60,15 @@ class _Tx(_EnvType):
     _type_members = {"origin": AddressT(), "gasprice": UINT256_T}
 
 
-CONSTANT_ENVIRONMENT_VARS = {t._id: t for t in (_Block(), _Chain(), _Tx(), _Msg())}
+CONSTANT_ENVIRONMENT_VARS = {
+    t._id: VarInfo(t, modifiability=Modifiability.RUNTIME_CONSTANT)
+    for t in (_Block(), _Chain(), _Tx(), _Msg())
+}
+# TODO: Fix this by adding some notion of built-in constants
+CONSTANT_ENVIRONMENT_VARS[_inf._id] = VarInfo(_inf, modifiability=Modifiability.CONSTANT)
 
 
-def get_constant_vars() -> Dict:
-    """
-    Get a dictionary of constant environment variables.
-    """
-    result = {}
-    for k, v in CONSTANT_ENVIRONMENT_VARS.items():
-        result[k] = VarInfo(v, is_constant=True)
-
-    return result
-
-
-MUTABLE_ENVIRONMENT_VARS: Dict[str, type] = {"self": AddressT}
+MUTABLE_ENVIRONMENT_VARS: Dict[str, type[VyperType]] = {"self": SelfT}
 
 
 def get_mutable_vars() -> Dict:

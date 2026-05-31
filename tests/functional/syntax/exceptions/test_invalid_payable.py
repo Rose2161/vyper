@@ -4,17 +4,15 @@ from pytest import raises
 from vyper import compiler
 from vyper.exceptions import NonPayableViolation
 
-fail_list = [
-    """
+fail_list = ["""
 @external
 def foo():
     x: uint256 = msg.value
-"""
-]
+"""]
 
 
 @pytest.mark.parametrize("bad_code", fail_list)
-def test_variable_decleration_exception(bad_code):
+def test_variable_declaration_exception(bad_code):
     with raises(NonPayableViolation):
         compiler.compile_code(bad_code)
 

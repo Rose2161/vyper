@@ -10,6 +10,7 @@ from vyper.codegen.core import (
     bytes_data_ptr,
     clamp,
     clamp_basetype,
+    clamp_le,
     get_bytearray_length,
     int_clamp,
     is_bytes_m_type,
@@ -23,6 +24,7 @@ from vyper.codegen.core import (
 )
 from vyper.codegen.expr import Expr
 from vyper.exceptions import (
+    CodegenPanic,
     CompilerPanic,
     InvalidLiteral,
     InvalidType,
@@ -40,6 +42,7 @@ from vyper.semantics.types import (
     StringT,
 )
 from vyper.semantics.types.bytestrings import _BytestringT
+from vyper.semantics.types.infinity import is_bounded_length
 from vyper.semantics.types.shortcuts import INT256_T, UINT160_T, UINT256_T
 from vyper.utils import DECIMAL_DIVISOR, round_towards_zero, unsigned_to_signed
 
@@ -80,13 +83,15 @@ def _bytes_to_num(arg, out_typ, signed):
     # e.g. "abcd000000000000" -> bitcast(000000000000abcd, output_type)
 
     if isinstance(arg.typ, _BytestringT):
+        if not is_bounded_length(arg.typ.maxlen):
+            raise CodegenPanic("convert: unbounded bytestring type")
         _len = get_bytearray_length(arg)
         arg = LOAD(bytes_data_ptr(arg))
         num_zero_bits = ["mul", 8, ["sub", 32, _len]]
     elif is_bytes_m_type(arg.typ):
         num_zero_bits = 8 * (32 - arg.typ.m)
-    else:
-        raise CompilerPanic("unreachable")  # pragma: notest
+    else:  # pragma: nocover
+        raise CompilerPanic("unreachable")
 
     if signed:
         ret = sar(num_zero_bits, arg)
@@ -110,8 +115,7 @@ def _clamp_numeric_convert(arg, arg_bounds, out_bounds, arg_is_signed):
         # out_hi must be smaller than MAX_UINT256, so clample makes sense.
         # add an assertion, just in case this assumption ever changes.
         assert out_hi < 2**256 - 1, "bad assumption in numeric convert"
-        CLAMP_OP = "sle" if arg_is_signed else "le"
-        arg = clamp(CLAMP_OP, arg, out_hi)
+        arg = clamp_le(arg, out_hi, arg_is_signed)
 
     return arg
 
@@ -219,14 +223,14 @@ def _literal_int(expr, arg_typ, out_typ):
     # TODO: possible to reuse machinery from expr.py?
     if isinstance(expr, vy_ast.Hex):
         val = int(expr.value, 16)
-    elif isinstance(expr, vy_ast.Bytes):
+    elif isinstance(expr, (vy_ast.Bytes, vy_ast.HexBytes)):
         val = int.from_bytes(expr.value, "big")
     elif isinstance(expr, (vy_ast.Int, vy_ast.Decimal, vy_ast.NameConstant)):
         val = expr.value
     else:  # pragma: no cover
         raise CompilerPanic("unreachable")
 
-    if isinstance(expr, (vy_ast.Hex, vy_ast.Bytes)) and out_typ.is_signed:
+    if isinstance(expr, (vy_ast.Hex, vy_ast.Bytes, vy_ast.HexBytes)) and out_typ.is_signed:
         val = _signextend(expr, val, arg_typ)
 
     lo, hi = out_typ.int_bounds
@@ -244,6 +248,7 @@ def _literal_decimal(expr, arg_typ, out_typ):
         val = decimal.Decimal(int(expr.value, 16))
     else:
         val = decimal.Decimal(expr.value)  # should work for Int, Decimal
+        assert isinstance(expr.value, int)
         val *= DECIMAL_DIVISOR
 
     # sanity check type checker did its job
@@ -252,7 +257,7 @@ def _literal_decimal(expr, arg_typ, out_typ):
     val = int(val)
 
     # apply sign extension, if expected
-    if isinstance(expr, (vy_ast.Hex, vy_ast.Bytes)) and out_typ.is_signed:
+    if isinstance(expr, vy_ast.Hex) and out_typ.is_signed:
         val = _signextend(expr, val, arg_typ)
 
     lo, hi = out_typ.int_bounds
@@ -308,7 +313,7 @@ def _to_int(expr, arg, out_typ):
     elif is_flag_type(arg.typ):
         if out_typ != UINT256_T:
             _FAIL(arg.typ, out_typ, expr)
-        # pretend enum is uint256
+        # pretend flag is uint256
         arg = IRnode.from_list(arg, typ=UINT256_T)
         # use int_to_int rules
         arg = _int_to_int(arg, out_typ)
@@ -359,8 +364,8 @@ def to_decimal(expr, arg, out_typ):
         # TODO: consider adding is_signed and bits to bool so we can use _int_to_fixed
         arg = ["mul", arg, 10**out_typ.decimals]
         return IRnode.from_list(arg, typ=out_typ)
-    else:
-        raise CompilerPanic("unreachable")  # pragma: notest
+    else:  # pragma: nocover
+        raise CompilerPanic("unreachable")
 
 
 @_input_types(IntegerT, DecimalT, BytesM_T, AddressT, BytesT, BoolT)
@@ -422,32 +427,40 @@ def to_address(expr, arg, out_typ):
     return IRnode.from_list(ret, out_typ)
 
 
+def _cast_bytestring(expr, arg, out_typ):
+    # ban converting Bytes[20] to Bytes[21]
+    if isinstance(arg.typ, out_typ.__class__) and arg.typ.maxlen <= out_typ.maxlen:
+        _FAIL(arg.typ, out_typ, expr)
+    # can't downcast literals with known length (e.g. b"abc" to Bytes[2])
+    if isinstance(expr, vy_ast.Constant) and arg.typ.maxlen > out_typ.maxlen:
+        _FAIL(arg.typ, out_typ, expr)
+
+    ret = ["seq"]
+    if out_typ.maxlen < arg.typ.maxlen:
+        ret.append(["assert", ["le", get_bytearray_length(arg), out_typ.maxlen]])
+    ret.append(arg)
+    # NOTE: this is a pointer cast
+    return IRnode.from_list(ret, typ=out_typ, location=arg.location, encoding=arg.encoding)
+
+
 # question: should we allow bytesM -> String?
-@_input_types(BytesT)
+@_input_types(BytesT, StringT)
 def to_string(expr, arg, out_typ):
-    _check_bytes(expr, arg, out_typ, out_typ.maxlen)
-
-    # NOTE: this is a pointer cast
-    return IRnode.from_list(arg, typ=out_typ)
+    return _cast_bytestring(expr, arg, out_typ)
 
 
-@_input_types(StringT)
+@_input_types(StringT, BytesT)
 def to_bytes(expr, arg, out_typ):
-    _check_bytes(expr, arg, out_typ, out_typ.maxlen)
-
-    # TODO: more casts
-
-    # NOTE: this is a pointer cast
-    return IRnode.from_list(arg, typ=out_typ)
+    return _cast_bytestring(expr, arg, out_typ)
 
 
 @_input_types(IntegerT)
-def to_enum(expr, arg, out_typ):
+def to_flag(expr, arg, out_typ):
     if arg.typ != UINT256_T:
         _FAIL(arg.typ, out_typ, expr)
 
-    if len(out_typ._enum_members) < 256:
-        arg = int_clamp(arg, bits=len(out_typ._enum_members), signed=False)
+    if len(out_typ._flag_members) < 256:
+        arg = int_clamp(arg, bits=len(out_typ._flag_members), signed=False)
 
     return IRnode.from_list(arg, typ=out_typ)
 
@@ -455,7 +468,7 @@ def to_enum(expr, arg, out_typ):
 def convert(expr, context):
     assert len(expr.args) == 2, "bad typecheck: convert"
 
-    arg_ast = expr.args[0]
+    arg_ast = expr.args[0].reduced()
     arg = Expr(arg_ast, context).ir_node
     original_arg = arg
 
@@ -469,7 +482,7 @@ def convert(expr, context):
         elif out_typ == AddressT():
             ret = to_address(arg_ast, arg, out_typ)
         elif is_flag_type(out_typ):
-            ret = to_enum(arg_ast, arg, out_typ)
+            ret = to_flag(arg_ast, arg, out_typ)
         elif is_integer_type(out_typ):
             ret = to_int(arg_ast, arg, out_typ)
         elif is_bytes_m_type(out_typ):

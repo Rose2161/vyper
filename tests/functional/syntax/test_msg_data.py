@@ -1,11 +1,12 @@
 import pytest
-from eth_tester.exceptions import TransactionFailed
+from eth_utils import to_bytes
 
 from vyper import compiler
-from vyper.exceptions import StructureException, TypeMismatch
+from vyper.exceptions import CodegenPanic, TypeMismatch, VyperException
+from vyper.utils import method_id
 
 
-def test_variable_assignment(get_contract, keccak):
+def test_variable_assignment(get_contract):
     code = """
 @external
 def foo() -> Bytes[4]:
@@ -14,8 +15,7 @@ def foo() -> Bytes[4]:
 """
 
     contract = get_contract(code)
-
-    assert contract.foo() == bytes(keccak(text="foo()")[:4])
+    assert contract.foo() == method_id("foo()")
 
 
 def test_slicing_start_index_other_than_zero(get_contract):
@@ -31,7 +31,7 @@ def foo(_value: uint256) -> uint256:
     assert contract.foo(42) == 42
 
 
-def test_get_full_calldata(get_contract, keccak, w3):
+def test_get_full_calldata(get_contract):
     code = """
 @external
 def foo(bar: uint256) -> Bytes[36]:
@@ -41,11 +41,11 @@ def foo(bar: uint256) -> Bytes[36]:
     contract = get_contract(code)
 
     # 2fbebd38000000000000000000000000000000000000000000000000000000000000002a
-    method_id = keccak(text="foo(uint256)").hex()[2:10]  # 2fbebd38
-    encoded_42 = w3.to_bytes(42).hex()  # 2a
-    expected_result = method_id + "00" * 31 + encoded_42
+    foo_method_id = method_id("foo(uint256)")  # 2fbebd38
+    encoded_42 = to_bytes(42)  # 2a
+    expected_result = foo_method_id + b"\0" * 31 + encoded_42
 
-    assert contract.foo(42).hex() == expected_result
+    assert contract.foo(42) == expected_result
 
 
 @pytest.mark.parametrize("bar", [0, 1, 42, 2**256 - 1])
@@ -73,10 +73,10 @@ def foo() -> (uint256, Bytes[4], uint256):
 """
     contract = get_contract(code)
 
-    assert contract.foo() == [2**256 - 1, bytes(keccak(text="foo()")[:4]), 2**256 - 1]
+    assert contract.foo() == (2**256 - 1, method_id("foo()"), 2**256 - 1)
 
 
-def test_assignment_to_storage(w3, get_contract, keccak):
+def test_assignment_to_storage(get_contract, keccak):
     code = """
 cache: public(Bytes[4])
 
@@ -84,11 +84,9 @@ cache: public(Bytes[4])
 def foo():
     self.cache = slice(msg.data, 0, 4)
 """
-    acct = w3.eth.accounts[0]
     contract = get_contract(code)
-
-    contract.foo(transact={"from": acct})
-    assert contract.cache() == bytes(keccak(text="foo()")[:4])
+    contract.foo()
+    assert contract.cache() == method_id("foo()")
 
 
 def test_get_len(get_contract):
@@ -110,7 +108,7 @@ def foo() -> Bytes[4]:
     bar: Bytes[4] = msg.data
     return bar
     """,
-        StructureException,
+        TypeMismatch,
     ),
     (
         """
@@ -119,16 +117,7 @@ def foo() -> Bytes[7]:
     bar: Bytes[7] = concat(msg.data, 0xc0ffee)
     return bar
     """,
-        StructureException,
-    ),
-    (
-        """
-@external
-def foo() -> uint256:
-    bar: uint256 = convert(msg.data, uint256)
-    return bar
-    """,
-        StructureException,
+        TypeMismatch,
     ),
     (
         """
@@ -138,7 +127,7 @@ a: HashMap[Bytes[10], uint256]
 def foo():
     self.a[msg.data] += 1
     """,
-        StructureException,
+        TypeMismatch,
     ),
     (
         """
@@ -158,7 +147,82 @@ def test_invalid_usages_compile_error(bad_code):
         compiler.compile_code(bad_code[0])
 
 
-def test_runtime_failure_bounds_check(get_contract):
+def test_invalid_usages_compile_error_not_polluted_by_prior_compilation():
+    poison_code = """
+a: HashMap[Bytes[10], uint256]
+
+@external
+def foo():
+    self.a[msg.data] += 1
+    """
+    with pytest.raises(TypeMismatch):
+        compiler.compile_code(poison_code)
+
+    for bad_code in (
+        """
+@external
+def foo() -> Bytes[4]:
+    bar: Bytes[4] = msg.data
+    return bar
+        """,
+        """
+@external
+def foo() -> Bytes[7]:
+    bar: Bytes[7] = concat(msg.data, 0xc0ffee)
+    return bar
+        """,
+    ):
+        with pytest.raises(TypeMismatch):
+            compiler.compile_code(bad_code)
+
+
+def test_invalid_usages_compile_error_not_polluted_within_same_module():
+    bad_code = """
+a: HashMap[Bytes[10], uint256]
+
+@external
+def poison():
+    self.a[msg.data] += 1
+
+@external
+def bad() -> Bytes[4]:
+    bar: Bytes[4] = msg.data
+    return bar
+    """
+    with pytest.raises(VyperException) as exc_info:
+        compiler.compile_code(bad_code)
+
+    err = str(exc_info.value)
+    # Both errors should be TypeMismatch about Bytes[INF]
+    assert err.count("TypeMismatch") == 2
+    assert err.count("Bytes[INF]") == 2
+    # Each error should mention the correct expected type (not polluted)
+    assert "Bytes[10]" in err  # for HashMap key
+    assert "Bytes[4]" in err  # for direct assignment
+
+
+def test_successful_compilation_no_cross_pollution():
+    """Compile two contracts sequentially that use msg.data via slice();
+    verify the first compilation's BytesT._length mutation doesn't leak."""
+    code_a = """
+@external
+def foo() -> uint256:
+    val: Bytes[100] = slice(msg.data, 0, 100)
+    return convert(slice(val, 4, 32), uint256)
+    """
+    code_b = """
+@external
+def bar() -> uint256:
+    val: Bytes[36] = slice(msg.data, 0, 36)
+    return convert(slice(val, 4, 32), uint256)
+    """
+    # Both should compile without error; A's larger slice must not
+    # poison B's msg.data type with a fixed _length.
+    compiler.compile_code(code_a)
+    compiler.compile_code(code_b)
+
+
+def test_runtime_failure_bounds_check(get_contract, tx_failed):
     code = """
 @external
 def foo(_value: uint256) -> uint256:
@@ -167,6 +231,27 @@ def foo(_value: uint256) -> uint256:
 """
 
     contract = get_contract(code)
-
-    with pytest.raises(TransactionFailed):
+    with tx_failed():
         contract.foo(42)
+
+
+@pytest.mark.xfail(raises=CodegenPanic, reason="unbounded sequence types not yet fully supported")
+def test_msg_data_assign_to_bytes_inf():
+    code = """
+@external
+def foo() -> Bytes[100]:
+    x: Bytes[INF] = msg.data
+    return slice(x, 0, 100)
+    """
+    compiler.compile_code(code)
+
+
+@pytest.mark.xfail(raises=CodegenPanic, reason="unbounded sequence types not yet fully supported")
+def test_msg_data_convert():
+    code = """
+@external
+def foo() -> uint256:
+    bar: uint256 = convert(msg.data, uint256)
+    return bar
+    """
+    compiler.compile_code(code)

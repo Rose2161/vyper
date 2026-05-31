@@ -1,15 +1,13 @@
-from typing import Optional
+from __future__ import annotations
 
-from vyper.venom.basicblock import (
-    IRBasicBlock,
-    IRInstruction,
-    IRLabel,
-    IROperand,
-    IRVariable,
-    MemType,
-)
+import textwrap
+from typing import TYPE_CHECKING, Iterator, Optional
 
-GLOBAL_LABEL = IRLabel("global")
+from vyper.codegen.ir_node import IRnode
+from vyper.venom.basicblock import IRBasicBlock, IRLabel, IRVariable
+
+if TYPE_CHECKING:
+    from vyper.venom.context import IRContext
 
 
 class IRFunction:
@@ -18,34 +16,53 @@ class IRFunction:
     """
 
     name: IRLabel  # symbol name
-    args: list
-    basic_blocks: list[IRBasicBlock]
-    data_segment: list[IRInstruction]
-    last_label: int
+    ctx: IRContext
     last_variable: int
+    _basic_block_dict: dict[str, IRBasicBlock]
 
-    def __init__(self, name: IRLabel = None) -> None:
-        if name is None:
-            name = GLOBAL_LABEL
+    # Internal-call metadata (excluding return_pc):
+    # - number of invoke params
+    # - whether first invoke param is a memory return buffer
+    _invoke_param_count: Optional[int]
+    _has_memory_return_buffer_param: Optional[bool]
+
+    # Used during code generation
+    _ast_source_stack: list[IRnode]
+    _error_msg_stack: list[Optional[str]]
+
+    def __init__(self, name: IRLabel, ctx: IRContext = None):
+        self.ctx = ctx  # type: ignore
         self.name = name
-        self.args = []
-        self.basic_blocks = []
-        self.data_segment = []
-        self.last_label = 0
+        self._basic_block_dict = {}
+
         self.last_variable = 0
+
+        self._invoke_param_count = None
+        self._has_memory_return_buffer_param = None
+
+        self._ast_source_stack = []
+        self._error_msg_stack = []
 
         self.append_basic_block(IRBasicBlock(name, self))
 
-    def append_basic_block(self, bb: IRBasicBlock) -> IRBasicBlock:
+    @property
+    def entry(self) -> IRBasicBlock:
+        return next(self.get_basic_blocks())
+
+    def append_basic_block(self, bb: IRBasicBlock):
         """
         Append basic block to function.
         """
-        assert isinstance(bb, IRBasicBlock), f"append_basic_block takes IRBasicBlock, got '{bb}'"
-        self.basic_blocks.append(bb)
+        assert isinstance(bb, IRBasicBlock), bb
+        assert bb.label.name not in self._basic_block_dict, bb.label
+        self._basic_block_dict[bb.label.name] = bb
 
-        # TODO add sanity check somewhere that basic blocks have unique labels
+    def remove_basic_block(self, bb: IRBasicBlock):
+        assert isinstance(bb, IRBasicBlock), bb
+        del self._basic_block_dict[bb.label.name]
 
-        return self.basic_blocks[-1]
+    def has_basic_block(self, label: str) -> bool:
+        return label in self._basic_block_dict
 
     def get_basic_block(self, label: Optional[str] = None) -> IRBasicBlock:
         """
@@ -53,101 +70,112 @@ class IRFunction:
         If label is None, return the last basic block.
         """
         if label is None:
-            return self.basic_blocks[-1]
-        for bb in self.basic_blocks:
-            if bb.label.value == label:
-                return bb
-        raise AssertionError(f"Basic block '{label}' not found")
+            return next(reversed(self._basic_block_dict.values()))
 
-    def get_basic_block_after(self, label: IRLabel) -> IRBasicBlock:
-        """
-        Get basic block after label.
-        """
-        for i, bb in enumerate(self.basic_blocks[:-1]):
-            if bb.label.value == label.value:
-                return self.basic_blocks[i + 1]
-        raise AssertionError(f"Basic block after '{label}' not found")
+        return self._basic_block_dict[label]
 
-    def get_basicblocks_in(self, basic_block: IRBasicBlock) -> list[IRBasicBlock]:
-        """
-        Get basic blocks that contain label.
-        """
-        return [bb for bb in self.basic_blocks if basic_block.label in bb.cfg_in]
+    def clear_basic_blocks(self):
+        self._basic_block_dict.clear()
 
-    def get_next_label(self) -> IRLabel:
-        self.last_label += 1
-        return IRLabel(f"{self.last_label}")
+    def get_basic_blocks(self) -> Iterator[IRBasicBlock]:
+        """
+        Get an iterator over this function's basic blocks
+        """
+        return iter(self._basic_block_dict.values())
 
-    def get_next_variable(
-        self, mem_type: MemType = MemType.OPERAND_STACK, mem_addr: Optional[int] = None
-    ) -> IRVariable:
+    @property
+    def num_basic_blocks(self) -> int:
+        return len(self._basic_block_dict)
+
+    @property
+    def code_size_cost(self) -> int:
+        return sum(bb.code_size_cost for bb in self.get_basic_blocks())
+
+    def get_next_variable(self) -> IRVariable:
         self.last_variable += 1
-        return IRVariable(f"%{self.last_variable}", mem_type, mem_addr)
+        return IRVariable(f"%{self.last_variable}")
 
     def get_last_variable(self) -> str:
         return f"%{self.last_variable}"
 
-    def remove_unreachable_blocks(self) -> int:
-        removed = 0
-        new_basic_blocks = []
-        for bb in self.basic_blocks:
-            if not bb.is_reachable and bb.label.value != "global":
-                removed += 1
-            else:
-                new_basic_blocks.append(bb)
-        self.basic_blocks = new_basic_blocks
-        return removed
+    def push_source(self, ir):
+        if isinstance(ir, IRnode):
+            self._ast_source_stack.append(ir.ast_source)
+            self._error_msg_stack.append(ir.error_msg)
 
-    def append_data(self, opcode: str, args: list[IROperand]) -> None:
-        """
-        Append data
-        """
-        self.data_segment.append(IRInstruction(opcode, args))  # type: ignore
+    def push_error_msg(self, error_msg: Optional[str]):
+        """Push an error message without changing ast_source."""
+        self._error_msg_stack.append(error_msg)
+
+    def pop_error_msg(self):
+        """Pop an error message."""
+        assert len(self._error_msg_stack) > 0, "Empty error stack"
+        self._error_msg_stack.pop()
+
+    def pop_source(self):
+        assert len(self._ast_source_stack) > 0, "Empty source stack"
+        self._ast_source_stack.pop()
+        assert len(self._error_msg_stack) > 0, "Empty error stack"
+        self._error_msg_stack.pop()
 
     @property
-    def normalized(self) -> bool:
-        """
-        Check if function is normalized. A function is normalized if in the
-        CFG, no basic block simultaneously has multiple inputs and outputs.
-        That is, a basic block can be jumped to *from* multiple blocks, or it
-        can jump *to* multiple blocks, but it cannot simultaneously do both.
-        Having a normalized CFG makes calculation of stack layout easier when
-        emitting assembly.
-        """
-        for bb in self.basic_blocks:
-            # Ignore if there are no multiple predecessors
-            if len(bb.cfg_in) <= 1:
-                continue
+    def ast_source(self) -> Optional[IRnode]:
+        return self._ast_source_stack[-1] if len(self._ast_source_stack) > 0 else None
 
-            # Check if there is a conditional jump at the end
-            # of one of the predecessors
-            #
-            # TODO: this check could be:
-            #  `if len(in_bb.cfg_out) > 1: return False`
-            # but the cfg is currently not calculated "correctly" for
-            # the special deploy instruction.
-            for in_bb in bb.cfg_in:
-                jump_inst = in_bb.instructions[-1]
-                if jump_inst.opcode in ("jnz", "djmp"):
-                    return False
-
-        # The function is normalized
-        return True
+    @property
+    def error_msg(self) -> Optional[str]:
+        return self._error_msg_stack[-1] if len(self._error_msg_stack) > 0 else None
 
     def copy(self):
         new = IRFunction(self.name)
-        new.basic_blocks = self.basic_blocks.copy()
-        new.data_segment = self.data_segment.copy()
-        new.last_label = self.last_label
-        new.last_variable = self.last_variable
+        for bb in self.get_basic_blocks():
+            new_bb = bb.copy()
+            new.append_basic_block(new_bb)
+
         return new
 
+    def as_graph(self, only_subgraph=False) -> str:
+        """
+        Return the function as a graphviz dot string. If only_subgraph is True, only return the
+        subgraph, not the full digraph -for embedding in a larger graph-
+        """
+        import html
+
+        def _make_label(bb):
+            ret = '<<table border="1" cellborder="0" cellspacing="0">'
+            ret += f'<tr><td align="left"><b>{html.escape(str(bb.label))}</b></td></tr>\n'
+            for inst in bb.instructions:
+                ret += f'<tr ><td align="left">{html.escape(str(inst))}</td></tr>\n'
+            ret += "</table>>"
+
+            return ret
+            # return f"{bb.label.value}:\n" + "\n".join([f"    {inst}" for inst in bb.instructions])
+
+        ret = []
+
+        if not only_subgraph:
+            ret.append("digraph G {{")
+        ret.append(f"subgraph {repr(self.name)} {{")
+
+        for bb in self.get_basic_blocks():
+            for out_bb in bb.out_bbs:
+                ret.append(f'    "{bb.label.value}" -> "{out_bb.label.value}"')
+
+        for bb in self.get_basic_blocks():
+            ret.append(f'    "{bb.label.value}" [shape=plaintext, ')
+            ret.append(f'label={_make_label(bb)}, fontname="Courier" fontsize="8"]')
+
+        ret.append("}\n")
+        if not only_subgraph:
+            ret.append("}\n")
+
+        return "\n".join(ret)
+
     def __repr__(self) -> str:
-        str = f"IRFunction: {self.name}\n"
-        for bb in self.basic_blocks:
-            str += f"{bb}\n"
-        if len(self.data_segment) > 0:
-            str += "Data segment:\n"
-            for inst in self.data_segment:
-                str += f"{inst}\n"
-        return str
+        ret = f"function {self.name} {{\n"
+        for bb in self.get_basic_blocks():
+            bb_str = textwrap.indent(str(bb), "  ")
+            ret += f"{bb_str}\n"
+        ret = ret.strip() + "\n}"
+        ret += f"  ; close function {self.name}"
+        return ret
