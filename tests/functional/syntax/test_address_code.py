@@ -1,44 +1,48 @@
+import json
+import re
 from typing import Type
 
 import pytest
-from eth_tester.exceptions import TransactionFailed
-from web3 import Web3
 
 from vyper import compiler
-from vyper.compiler.settings import Settings
-from vyper.exceptions import NamespaceCollision, StructureException, VyperException
+from vyper.exceptions import (
+    CodegenPanic,
+    NamespaceCollision,
+    StructureException,
+    TypeMismatch,
+    VyperException,
+)
 
 # For reproducibility, use precompiled data of `hello: public(uint256)` using vyper 0.3.1
-PRECOMPILED_ABI = """[{"stateMutability": "view", "type": "function", "name": "hello", "inputs": [], "outputs": [{"name": "", "type": "uint256"}], "gas": 2460}]"""  # noqa: E501
+PRECOMPILED_ABI = """[{"stateMutability": "view", "type": "function", "name": "hello", "inputs": [], "outputs": [{"name": "", "type": "uint256"}], "gas": 2460}]"""  # noqa: E501, FS003
 PRECOMPILED_BYTECODE = """0x61004456600436101561000d57610035565b60046000601c376000513461003b576319ff1d2181186100335760005460e052602060e0f35b505b60006000fd5b600080fd5b61000461004403610004600039610004610044036000f3"""  # noqa: E501
 PRECOMPILED_BYTECODE_RUNTIME = """0x600436101561000d57610035565b60046000601c376000513461003b576319ff1d2181186100335760005460e052602060e0f35b505b60006000fd5b600080fd"""  # noqa: E501
 PRECOMPILED = bytes.fromhex(PRECOMPILED_BYTECODE_RUNTIME[2:])
 
 
-def _deploy_precompiled_contract(w3: Web3):
-    Precompiled = w3.eth.contract(abi=PRECOMPILED_ABI, bytecode=PRECOMPILED_BYTECODE)
-    tx_hash = Precompiled.constructor().transact()
-    tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-    address = tx_receipt["contractAddress"]
-    return w3.eth.contract(address=address, abi=PRECOMPILED_ABI)
+@pytest.fixture
+def precompiled_contract(env):
+    bytecode = bytes.fromhex(PRECOMPILED_BYTECODE.removeprefix("0x"))
+    return env.deploy(json.loads(PRECOMPILED_ABI), bytecode)
 
 
 @pytest.mark.parametrize(
     ("start", "length", "expected"), [(0, 5, PRECOMPILED[:5]), (5, 10, PRECOMPILED[5:][:10])]
 )
-def test_address_code_slice(start: int, length: int, expected: bytes, w3: Web3, get_contract):
+def test_address_code_slice(
+    start: int, length: int, expected: bytes, precompiled_contract, get_contract
+):
     code = f"""
 @external
 def code_slice(x: address) -> Bytes[{length}]:
     return slice(x.code, {start}, {length})
 """
     contract = get_contract(code)
-    precompiled_contract = _deploy_precompiled_contract(w3)
     actual = contract.code_slice(precompiled_contract.address)
     assert actual == expected
 
 
-def test_address_code_runtime_error_slice_too_long(w3: Web3, get_contract):
+def test_address_code_runtime_error_slice_too_long(precompiled_contract, get_contract, tx_failed):
     start = len(PRECOMPILED) - 5
     length = 10
     code = f"""
@@ -47,36 +51,24 @@ def code_slice(x: address) -> Bytes[{length}]:
     return slice(x.code, {start}, {length})
 """
     contract = get_contract(code)
-    precompiled_contract = _deploy_precompiled_contract(w3)
-    with pytest.raises(TransactionFailed):
+    with tx_failed():
         contract.code_slice(precompiled_contract.address)
 
 
-def test_address_code_runtime_error_no_code(get_contract):
+def test_address_code_runtime_error_no_code(get_contract, tx_failed):
     code = """
 @external
 def code_slice(x: address) -> Bytes[4]:
     return slice(x.code, 0, 4)
 """
     contract = get_contract(code)
-    with pytest.raises(TransactionFailed):
+    with tx_failed():
         contract.code_slice(b"\x00" * 20)
 
 
 @pytest.mark.parametrize(
     ("bad_code", "error_type", "error_message"),
     [
-        (
-            # `(address).code` without `slice`
-            """
-@external
-def code_slice(x: address) -> uint256:
-    y: uint256 = convert(x.code, uint256)
-    return y
-""",
-            StructureException,
-            "(address).code is only allowed inside of a slice function with a constant length",
-        ),
         (
             """
 a: HashMap[Bytes[4], uint256]
@@ -85,19 +77,8 @@ a: HashMap[Bytes[4], uint256]
 def foo(x: address):
     self.a[x.code] += 1
 """,
-            StructureException,
-            "(address).code is only allowed inside of a slice function with a constant length",
-        ),
-        (
-            # `len` not supported
-            """
-@external
-def code_slice(x: address) -> uint256:
-    y: uint256 = len(x.code)
-    return y
-""",
-            StructureException,
-            "(address).code is only allowed inside of a slice function with a constant length",
+            TypeMismatch,
+            "Given reference has type Bytes[INF], expected Bytes[4]",
         ),
         (
             # `slice` with non static length
@@ -107,8 +88,8 @@ def code_slice(x: address, y: uint256) -> Bytes[4]:
     z: Bytes[4] = slice(x.code, 0, y)
     return z
 """,
-            StructureException,
-            "(address).code is only allowed inside of a slice function with a constant length",
+            TypeMismatch,
+            "Given reference has type Bytes[INF], expected Bytes[4]",
         ),
         (
             # `self.code` is already defined since `self` is address
@@ -116,7 +97,7 @@ def code_slice(x: address, y: uint256) -> Bytes[4]:
 code: public(Bytes[4])
 """,
             NamespaceCollision,
-            "Value 'code' has already been declared",
+            "Member 'code' already exists in self",
         ),
     ],
 )
@@ -153,7 +134,7 @@ interface Test:
 
 @external
 def foo(x: address) -> Bytes[4]:
-    return slice(Test(x).out_literals().code, 0, 4)
+    return slice((staticcall Test(x).out_literals()).code, 0, 4)
 """,
     ],
 )
@@ -161,11 +142,11 @@ def test_address_code_compile_success(code: str):
     compiler.compile_code(code)
 
 
-def test_address_code_self_success(get_contract, optimize):
+def test_address_code_self_success(get_contract):
     code = """
 code_deployment: public(Bytes[32])
 
-@external
+@deploy
 def __init__():
     self.code_deployment = slice(self.code, 0, 32)
 
@@ -174,32 +155,127 @@ def code_runtime() -> Bytes[32]:
     return slice(self.code, 0, 32)
 """
     contract = get_contract(code)
-    settings = Settings(optimize=optimize)
-    code_compiled = compiler.compile_code(
-        code, output_formats=["bytecode", "bytecode_runtime"], settings=settings
-    )
+    code_compiled = compiler.compile_code(code, output_formats=["bytecode", "bytecode_runtime"])
     assert contract.code_deployment() == bytes.fromhex(code_compiled["bytecode"][2:])[:32]
     assert contract.code_runtime() == bytes.fromhex(code_compiled["bytecode_runtime"][2:])[:32]
 
 
-def test_address_code_self_runtime_error_deployment(get_contract):
+def test_address_code_self_runtime_error_deployment(get_contract, tx_failed):
     code = """
 dummy: public(Bytes[1000000])
 
-@external
+@deploy
 def __init__():
     self.dummy = slice(self.code, 0, 1000000)
 """
-    with pytest.raises(TransactionFailed):
+    with tx_failed():
         get_contract(code)
 
 
-def test_address_code_self_runtime_error_runtime(get_contract):
+def test_address_code_self_runtime_error_runtime(get_contract, tx_failed):
     code = """
 @external
 def code_runtime() -> Bytes[1000000]:
     return slice(self.code, 0, 1000000)
 """
     contract = get_contract(code)
-    with pytest.raises(TransactionFailed):
+    with tx_failed():
         contract.code_runtime()
+
+
+def test_code_attribute_regression(get_contract, env):
+    """
+    Regression test for .code attribute handling in slice() context.
+    Tests self.code and addr.code work correctly with related address properties.
+    """
+    code = """
+@external
+def test_self_code() -> Bytes[50]:
+    return slice(self.code, 0, 50)
+
+@external
+def test_addr_code(addr: address) -> Bytes[50]:
+    return slice(addr.code, 0, 50)
+
+@external
+def test_code_properties(addr: address) -> (uint256, uint256, bytes32, bool):
+    return (
+        addr.codesize,
+        addr.balance,
+        addr.codehash,
+        addr.is_contract
+    )
+    """
+    c = get_contract(code)
+
+    # Test self.code returns bytecode
+    self_code = c.test_self_code()
+    assert len(self_code) == 50
+
+    # Test addr.code returns bytecode
+    addr_code = c.test_addr_code(c.address)
+    assert len(addr_code) == 50
+    assert self_code == addr_code  # self.code == self.address.code
+
+    # Test related code properties
+    codesize, balance, codehash, is_contract = c.test_code_properties(c.address)
+    assert codesize > 0
+    assert balance == 0
+    assert codehash != b"\x00" * 32
+    assert is_contract is True
+
+
+@pytest.mark.xfail(raises=CodegenPanic, reason="unbounded sequence types not yet fully supported")
+def test_address_code_convert():
+    code = """
+@external
+def code_slice(x: address) -> uint256:
+    y: uint256 = convert(x.code, uint256)
+    return y
+"""
+    compiler.compile_code(code)
+
+
+@pytest.mark.parametrize(
+    ("code", "error_message"),
+    [
+        # plain address variable
+        (
+            """
+@external
+def foo(x: address) -> uint256:
+    y: uint256 = len(x.code)
+    return y
+""",
+            "`len(x.code)` is inefficient: use `x.codesize` instead",
+        ),
+        # self address
+        (
+            """
+@external
+def foo() -> uint256:
+    y: uint256 = len(self.code)
+    return y
+""",
+            "`len(self.code)` is inefficient: use `self.codesize` instead",
+        ),
+        # environment variable
+        (
+            """
+@external
+def foo() -> uint256:
+    y: uint256 = len(msg.sender.code)
+    return y
+""",
+            "`len(msg.sender.code)` is inefficient: use `msg.sender.codesize` instead",
+        ),
+    ],
+)
+def test_address_code_len(code, error_message):
+    with pytest.raises(StructureException) as excinfo:
+        compiler.compile_code(code)
+    assert excinfo.value.message == error_message
+
+    # verify the recommendation compiles
+    fixed = re.sub(r"len\((\S+)\.code\)", r"\1.codesize", code)
+    compiler.compile_code(fixed)

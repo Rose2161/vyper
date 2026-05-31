@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from functools import cached_property
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -13,19 +15,40 @@ from vyper.exceptions import (
     UnknownAttribute,
 )
 from vyper.semantics.analysis.levenshtein_utils import get_levenshtein_error_suggestions
+from vyper.semantics.data_locations import DataLocation
 
 
 # Some fake type with an overridden `compare_type` which accepts any RHS
 # type of type `type_`
 class _GenericTypeAcceptor:
     def __repr__(self):
-        return repr(self.type_)
+        return f"GenericTypeAcceptor({self.type_})"
 
     def __init__(self, type_):
         self.type_ = type_
 
+    def is_subtype_of(self, other):
+        return other.compare_type(self)
+
+    def is_supertype_of(self, other):
+        return self.compare_type(other)
+
+    def is_equivalent_to(self, other):
+        return self.compare_type(other) and other.compare_type(self)
+
     def compare_type(self, other):
-        return isinstance(other, self.type_)
+        if isinstance(other, self.type_):
+            return True
+        # compare two GenericTypeAcceptors -- they are the same if the base
+        # type is the same
+        return isinstance(other, self.__class__) and other.type_ == self.type_
+
+    def to_dict(self):
+        # this shouldn't really appear in the AST type annotations, but it's
+        # there for certain string literals which don't have a known type. this
+        # should be fixed soon by improving type inference. for now just put
+        # *something* in the AST.
+        return {"generic": self.type_.typeclass}
 
 
 class VyperType:
@@ -36,8 +59,12 @@ class VyperType:
     ----------
     _id : str
         The name of the type.
-    _as_array: bool, optional
-        If `True`, this type can be used as the base member for an array.
+    is_valid_element_type: bool, optional
+        If `True`, this type can be used as the type of the elements of an array.
+    _as_hashmap_key: bool, optional
+        If `True`, this type can be used as a hashmap key
+    is_valid_member_type: bool, optional
+        If `True`, this type can be used as a member type
     _valid_literal : Tuple
         A tuple of Vyper ast classes that may be assigned this type.
     _invalid_locations : Tuple
@@ -53,7 +80,9 @@ class VyperType:
         `InterfaceT`s.
     """
 
-    _id: str
+    typeclass: str = None  # type: ignore
+
+    _id: str  # rename to `_name`
     _type_members: Optional[Dict] = None
     _valid_literal: Tuple = ()
     _invalid_locations: Tuple = ()
@@ -62,13 +91,16 @@ class VyperType:
     _is_array_type: bool = False
     _is_bytestring: bool = False  # is it a bytes or a string?
 
-    _as_array: bool = False  # rename to something like can_be_array_member
+    is_valid_element_type: bool = False
     _as_hashmap_key: bool = False
+    is_valid_member_type: bool = True
 
     _supports_external_calls: bool = False
     _attribute_in_annotation: bool = False
 
     size_in_bytes = 32  # default; override for larger types
+
+    decl_node: Optional[vy_ast.VyperNode] = None
 
     def __init__(self, members: Optional[Dict] = None) -> None:
         self.members: Dict = {}
@@ -91,16 +123,55 @@ class VyperType:
         return hash(self._get_equality_attrs())
 
     def __eq__(self, other):
+        if self is other:
+            return True
         return (
             type(self) is type(other) and self._get_equality_attrs() == other._get_equality_attrs()
         )
 
     def __lt__(self, other):
+        # CMC 2024-10-20 what is this for?
         return self.abi_type.selector_name() < other.abi_type.selector_name()
+
+    def __repr__(self):
+        # TODO: add `pretty()` to the VyperType API?
+        return self._id
+
+    # return a dict suitable for serializing in the AST
+    def to_dict(self):
+        ret = {"name": self._id}
+        if self.decl_node is not None:
+            ret["type_decl_node"] = self.decl_node.get_id_dict()
+        if self.typeclass is not None:
+            ret["typeclass"] = self.typeclass
+
+        # use dict ctor to block duplicates
+        return dict(sorted(self._addl_dict_fields().items()), **ret)
+
+    # for most types, this is a reasonable implementation, but it can
+    # be overridden as needed.
+    def _addl_dict_fields(self):
+        keys = self._equality_attrs or ()
+        ret = {}
+        for k in keys:
+            if k.startswith("_"):
+                continue
+            v = getattr(self, k)
+            if hasattr(v, "to_dict"):
+                v = v.to_dict()
+            ret[k] = v
+        return ret
 
     @cached_property
     def _as_darray(self):
-        return self._as_array
+        return self.is_valid_element_type
+
+    @property
+    def has_wildcard(self):
+        return False
+
+    def resolve_wildcard(self):
+        return self
 
     @property
     def getter_signature(self):
@@ -116,7 +187,19 @@ class VyperType:
         """
         The ABI type corresponding to this type
         """
-        raise CompilerPanic("Method must be implemented by the inherited class")
+        raise CompilerPanic(f"{type(self).__name__} does not implement abi_type")
+
+    def get_size_in(self, location: DataLocation) -> int:
+        if location in (DataLocation.STORAGE, DataLocation.TRANSIENT):
+            return self.storage_size_in_words
+        if location == DataLocation.MEMORY:
+            return self.memory_bytes_required
+        if location in (DataLocation.CODE, DataLocation.IMMUTABLES):
+            return self.memory_bytes_required
+        if location == DataLocation.CALLDATA:
+            return self.memory_bytes_required
+
+        raise CompilerPanic(f"unreachable: invalid location {location}")  # pragma: nocover
 
     @property
     def memory_bytes_required(self) -> int:
@@ -143,7 +226,7 @@ class VyperType:
         """
         return self.abi_type.selector_name()
 
-    def to_abi_arg(self, name: str = "") -> Dict[str, Any]:
+    def to_abi_arg(self, name: str = "") -> dict[str, Any]:
         """
         The JSON ABI description of this type. Note for complex types,
         the implementation is overridden to be compliant with the spec:
@@ -166,7 +249,7 @@ class VyperType:
         # TODO maybe make these AST classes inherit from "HasOperator"
         node: Union[vy_ast.UnaryOp, vy_ast.BinOp, vy_ast.AugAssign, vy_ast.Compare, vy_ast.BoolOp],
     ) -> None:
-        raise InvalidOperation(f"Cannot perform {node.op.description} on {self}", node)
+        raise InvalidOperation(f"Cannot perform {node.op.description} on {self}", node.op)
 
     def validate_comparator(self, node: vy_ast.Compare) -> None:
         """
@@ -232,6 +315,78 @@ class VyperType:
     def validate_index_type(self, node: vy_ast.Subscript) -> None:
         raise StructureException(f"Not an indexable type: '{self}'", node)
 
+    def is_supertype_of(self, other: VyperType) -> bool:
+        """
+        Compare this type object against another type object.
+
+        Failed comparisons must return `False`, not raise an exception.
+
+        This method does *not* test for type equality, it is a type
+        checker function, it should have the meaning: "an expr of type
+        <other> can be assigned to an expr of type <self>."
+
+        DO NOT override this in subclasses, instead override compare_type
+
+        Arguments
+        ---------
+        other: VyperType
+            Another type object to be compared against this one.
+
+        Returns
+        -------
+        bool
+            Indicates if self is a supertype of other
+        """
+        return self.compare_type(other)
+
+    def is_subtype_of(self, other: VyperType) -> bool:
+        """
+        Compare this type object against another type object.
+
+        Failed comparisons must return `False`, not raise an exception.
+
+        This method does *not* test for type equality, it is a type
+        checker function, it should have the meaning: "an expr of type
+        <self> can be assigned to an expr of type <other>."
+
+        DO NOT override this in subclasses, instead override compare_type
+
+        Arguments
+        ---------
+        other: VyperType
+            Another type object to be compared against this one.
+
+        Returns
+        -------
+        bool
+            Indicates if self is a subtype of other.
+        """
+        return other.is_supertype_of(self)
+
+    def is_equivalent_to(self, other: VyperType) -> bool:
+        """
+        Compare this type object against another type object.
+
+        Failed comparisons must return `False`, not raise an exception.
+
+        This method does test for type equality, it is a type checker function, it should have
+        the meaning: "<self> and <other> can be used interchangeably"
+
+        DO NOT override this in subclasses, instead override compare_type
+
+        Arguments
+        ---------
+        other: VyperType
+            Another type object to be compared against this one.
+
+        Returns
+        -------
+        bool
+            Indicates if self is a subtype of other.
+        """
+        return self.is_subtype_of(other) and self.is_supertype_of(other)
+
+    # TODO: Deprecate in favor of one of the clearer above methods
     def compare_type(self, other: "VyperType") -> bool:
         """
         Compare this type object against another type object.
@@ -274,7 +429,7 @@ class VyperType:
         raise StructureException(f"{self} is not callable", node)
 
     @classmethod
-    def get_subscripted_type(self, node: vy_ast.Index) -> None:
+    def get_subscripted_type(self, node: vy_ast.VyperNode) -> None:
         """
         Return the type of a subscript expression, e.g. x[1]
 
@@ -290,10 +445,14 @@ class VyperType:
         """
         raise StructureException(f"'{self}' cannot be indexed into", node)
 
+    def _check_add_member(self, name):
+        if (prev_type := self.members.get(name)) is not None:
+            msg = f"Member '{name}' already exists in {self}"
+            raise NamespaceCollision(msg, prev_decl=prev_type.decl_node)
+
     def add_member(self, name: str, type_: "VyperType") -> None:
         validate_identifier(name)
-        if name in self.members:
-            raise NamespaceCollision(f"Member '{name}' already exists in {self}")
+        self._check_add_member(name)
         self.members[name] = type_
 
     def get_member(self, key: str, node: vy_ast.VyperNode) -> "VyperType":
@@ -304,11 +463,8 @@ class VyperType:
         if not self.members:
             raise StructureException(f"{self} instance does not have members", node)
 
-        suggestions_str = get_levenshtein_error_suggestions(key, self.members, 0.3)
-        raise UnknownAttribute(f"{self} has no member '{key}'. {suggestions_str}", node)
-
-    def __repr__(self):
-        return self._id
+        hint = get_levenshtein_error_suggestions(key, self.members, 0.3)
+        raise UnknownAttribute(f"{repr(self)} has no member '{key}'.", node, hint=hint)
 
 
 class KwargSettings:
@@ -324,15 +480,44 @@ class KwargSettings:
         self.require_literal = require_literal
 
 
+class _VoidType(VyperType):
+    _id = "(void)"
+
+
+# sentinel for function calls which return nothing
+VOID_TYPE = _VoidType()
+
+
+def map_void(typ: Optional[VyperType]) -> VyperType:
+    if typ is None:
+        return VOID_TYPE
+    return typ
+
+
 # A type type. Used internally for types which can live in expression
 # position, ex. constructors (events, interfaces and structs), and also
 # certain builtins which take types as parameters
-class TYPE_T:
+class TYPE_T(VyperType):
     def __init__(self, typedef):
+        super().__init__()
+
         self.typedef = typedef
+
+    @property
+    def is_modifying(self) -> bool:
+        # Constructor calls cannot mutate state
+        return False
+
+    def to_dict(self):
+        return {"type_t": self.typedef.to_dict()}
 
     def __repr__(self):
         return f"type({self.typedef})"
+
+    def check_modifiability_for_call(self, node, modifiability):
+        if hasattr(self.typedef, "_ctor_modifiability_for_call"):
+            return self.typedef._ctor_modifiability_for_call(node, modifiability)
+        raise StructureException("Value is not callable", node)
 
     # dispatch into ctor if it's called
     def fetch_call_return(self, node):
@@ -340,7 +525,7 @@ class TYPE_T:
             return self.typedef._ctor_call_return(node)
         raise StructureException("Value is not callable", node)
 
-    def infer_arg_types(self, node):
+    def infer_arg_types(self, node, expected_return_typ=None):
         if hasattr(self.typedef, "_ctor_arg_types"):
             return self.typedef._ctor_arg_types(node)
         raise StructureException("Value is not callable", node)
@@ -351,7 +536,7 @@ class TYPE_T:
         raise StructureException("Value is not callable", node)
 
     # dispatch into get_type_member if it's dereferenced, ex.
-    # MyEnum.FOO
+    # MyFlag.FOO
     def get_member(self, key, node):
         if hasattr(self.typedef, "get_type_member"):
             return self.typedef.get_type_member(key, node)

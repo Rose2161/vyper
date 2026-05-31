@@ -5,7 +5,7 @@ def test_basic_init_function(get_contract):
     code = """
 val: public(uint256)
 
-@external
+@deploy
 def __init__(a: uint256):
     self.val = a
     """
@@ -15,22 +15,24 @@ def __init__(a: uint256):
     assert c.val() == 123
 
     # Make sure the init code does not access calldata
-    assembly = vyper.compile_code(code, output_formats=["asm"])["asm"].split(" ")
-    ir_return_idx_start = assembly.index("{")
-    ir_return_idx_end = assembly.index("}")
+    compiler_output = vyper.compile_code(code, output_formats=["asm", "asm_runtime"])
+    asm_deploytime = compiler_output["asm"]
+    asm_runtime = compiler_output["asm_runtime"]
 
-    assert "CALLDATALOAD" in assembly
-    assert "CALLDATACOPY" not in assembly[:ir_return_idx_start] + assembly[ir_return_idx_end:]
-    assert "CALLDATALOAD" not in assembly[:ir_return_idx_start] + assembly[ir_return_idx_end:]
+    assert "CALLDATALOAD" in asm_runtime
+    assert "CALLDATACOPY" not in asm_deploytime
+    assert "CALLDATALOAD" not in asm_deploytime
 
 
 def test_init_calls_internal(get_contract, assert_compile_failed, tx_failed):
     code = """
 foo: public(uint8)
+
 @internal
 def bar(x: uint256) -> uint8:
     return convert(x, uint8) * 7
-@external
+
+@deploy
 def __init__(a: uint256):
     self.foo = self.bar(a)
 
@@ -61,7 +63,7 @@ def test_nested_internal_call_from_ctor(get_contract):
     code = """
 x: uint256
 
-@external
+@deploy
 def __init__():
     self.a()
 

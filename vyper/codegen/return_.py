@@ -3,9 +3,11 @@ from typing import Any, Optional
 from vyper.codegen.abi_encoder import abi_encode, abi_encoding_matches_vyper
 from vyper.codegen.context import Context
 from vyper.codegen.core import (
+    bytes_data_ptr,
     calculate_type_for_external_return,
     check_assign,
     dummy_node_for_type,
+    get_bytearray_length,
     get_type_for_exact_size,
     make_setter,
     needs_clamp,
@@ -13,6 +15,7 @@ from vyper.codegen.core import (
 )
 from vyper.codegen.ir_node import IRnode
 from vyper.evm.address_space import MEMORY
+from vyper.exceptions import TypeCheckFailure
 
 Stmt = Any  # mypy kludge
 
@@ -24,8 +27,8 @@ def make_return_stmt(ir_val: IRnode, stmt: Any, context: Context) -> Optional[IR
     jump_to_exit = ["exit_to", func_t._ir_info.exit_sequence_label]
 
     if context.return_type is None:
-        if stmt.value is not None:
-            return None  # triggers an exception
+        if stmt.value is not None:  # pragma: nocover
+            raise TypeCheckFailure("bad return")
 
     else:
         # sanity typecheck
@@ -41,7 +44,6 @@ def make_return_stmt(ir_val: IRnode, stmt: Any, context: Context) -> Optional[IR
         # NOTE: because stack analysis is incomplete, cleanup_repeat must
         # come after fill_return_buffer otherwise the stack will break
         jump_to_exit_ir = IRnode.from_list(jump_to_exit)
-        jump_to_exit_ir.passthrough_metadata["func_t"] = func_t
         return IRnode.from_list(["seq", fill_return_buffer, cleanup_loops, jump_to_exit_ir])
 
     if context.return_type is None:
@@ -57,6 +59,19 @@ def make_return_stmt(ir_val: IRnode, stmt: Any, context: Context) -> Optional[IR
         return finalize(fill_return_buffer)
 
     else:  # return from external function
+        # raw return
+        if context.func_t.do_raw_return:
+            # copy to memory
+            buf = context.new_internal_variable(context.return_type)
+
+            fill_return_buffer = make_setter(buf, ir_val)
+
+            return_len = get_bytearray_length(buf)
+            return_offset = bytes_data_ptr(buf)
+            jump_to_exit += [return_offset, return_len]  # type: ignore
+
+            return finalize(fill_return_buffer)
+
         external_return_type = calculate_type_for_external_return(context.return_type)
         maxlen = external_return_type.abi_type.size_bound()
 

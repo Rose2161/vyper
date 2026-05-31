@@ -1,7 +1,13 @@
 import pytest
 
-from vyper import compiler
-from vyper.exceptions import ArgumentException, InvalidType, SyntaxException, TypeMismatch
+from vyper import compile_code
+from vyper.exceptions import (
+    ArgumentException,
+    InvalidType,
+    StateAccessViolation,
+    SyntaxException,
+    TypeMismatch,
+)
 
 fail_list = [
     (
@@ -33,13 +39,92 @@ def foo():
     """,
         InvalidType,
     ),
+    (
+        """
+@external
+@view
+def foo(_addr: address):
+    raw_call(_addr, method_id("foo()"))
+    """,
+        StateAccessViolation,
+    ),
+    # non-static call cannot be used in a range expression
+    (
+        """
+@external
+def foo(a: address):
+    for i: uint256 in range(
+        0,
+        extract32(raw_call(a, b"", max_outsize=32), 0, output_type=uint256),
+        bound = 12
+    ):
+        pass
+    """,
+        StateAccessViolation,
+    ),
+    # call cannot be both a delegate call and a static call
+    (
+        """
+@external
+def foo(_addr: address):
+    raw_call(_addr, method_id("foo()"), is_delegate_call=True, is_static_call=True)
+    """,
+        ArgumentException,
+    ),
+    # value cannot be passed for delegate call
+    (
+        """
+@external
+def foo(_addr: address):
+    raw_call(_addr, method_id("foo()"), is_delegate_call=True, value=1)
+    """,
+        ArgumentException,
+    ),
+    #
+    (
+        """
+@external
+def foo(_addr: address):
+    raw_call(_addr, method_id("foo()"), is_static_call=True, value=1)
+    """,
+        ArgumentException,
+    ),
+    # second argument should be Bytes
+    (
+        """
+@external
+@view
+def foo(_addr: address):
+    raw_call(_addr, 256)
+    """,
+        TypeMismatch,
+    ),
+    (
+        """
+@pure
+@external
+def foo(a: address):
+    # test staticcall detection from pure function
+    x: Bytes[32] = raw_call(a, b'', max_outsize=32, is_static_call=True)
+    """,
+        StateAccessViolation,
+    ),
+    (
+        """
+@pure
+def foo(a: address):
+    # test staticcall detection from pure function with constant folding
+    x: Bytes[32] = raw_call(a, b'', max_outsize=32, is_static_call=True or False)
+    """,
+        StateAccessViolation,
+    ),
 ]
 
 
 @pytest.mark.parametrize("bad_code,exc", fail_list)
 def test_raw_call_fail(bad_code, exc):
     with pytest.raises(exc):
-        compiler.compile_code(bad_code)
+        compile_code(bad_code)
 
 
 valid_list = [
@@ -90,9 +175,23 @@ def foo():
         value=self.balance - self.balances[0]
     )
     """,
+    # test constants
+    """
+OUTSIZE: constant(uint256) = 4
+REVERT_ON_FAILURE: constant(bool) = True
+@external
+def foo():
+    x: Bytes[9] = raw_call(
+        0x1234567890123456789012345678901234567890,
+        b"cow",
+        max_outsize=OUTSIZE,
+        gas=595757,
+        revert_on_failure=REVERT_ON_FAILURE
+    )
+    """,
 ]
 
 
 @pytest.mark.parametrize("good_code", valid_list)
 def test_raw_call_success(good_code):
-    assert compiler.compile_code(good_code) is not None
+    assert compile_code(good_code) is not None

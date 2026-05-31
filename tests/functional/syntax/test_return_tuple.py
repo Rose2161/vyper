@@ -3,15 +3,11 @@ import pytest
 from vyper import compiler
 from vyper.exceptions import FunctionDeclarationException
 
-pytestmark = pytest.mark.usefixtures("memory_mocker")
-
-fail_list = [
-    """
+fail_list = ["""
 @external
 def unmatched_tupl_length() -> (Bytes[8], int128, Bytes[8]):
     return "test", 123
-    """
-]
+    """]
 
 
 @pytest.mark.parametrize("bad_code", fail_list)
@@ -34,7 +30,7 @@ def foo() -> (uint256, uint256, uint256, uint256, uint256):
 
     c = get_contract(code)
 
-    assert c.foo() == [1, 2, 3, 4, 5]
+    assert c.foo() == (1, 2, 3, 4, 5)
 
 
 def test_call_in_call(get_contract):
@@ -55,7 +51,7 @@ def foo() -> (uint256, uint256, uint256, uint256, uint256):
 
     c = get_contract(code)
 
-    assert c.foo() == [1, 2, 3, 4, 5]
+    assert c.foo() == (1, 2, 3, 4, 5)
 
 
 def test_nested_calls_in_tuple_return(get_contract):
@@ -86,7 +82,7 @@ def foo() -> (uint256, uint256, uint256, uint256, uint256):
 
     c = get_contract(code)
 
-    assert c.foo() == [1, 2, 3, 4, 5]
+    assert c.foo() == (1, 2, 3, 4, 5)
 
 
 def test_external_call_in_return_tuple(get_contract):
@@ -103,13 +99,13 @@ interface Foo:
 
 @external
 def foo(a: address) -> (uint256, uint256, uint256, uint256, uint256):
-    return 1, 2, Foo(a).foo()[0], 4, 5
+    return 1, 2, (staticcall Foo(a).foo())[0], 4, 5
     """
 
     c = get_contract(code)
     c2 = get_contract(code2)
 
-    assert c2.foo(c.address) == [1, 2, 3, 4, 5]
+    assert c2.foo(c.address) == (1, 2, 3, 4, 5)
 
 
 def test_nested_external_call_in_return_tuple(get_contract):
@@ -132,13 +128,19 @@ interface Foo:
 
 @external
 def foo(a: address) -> (uint256, uint256, uint256, uint256, uint256):
-    return 1, 2, Foo(a).foo()[0], 4, Foo(a).bar(Foo(a).foo()[1])
+    return (
+        1,
+        2,
+        (staticcall Foo(a).foo())[0],
+        4,
+        staticcall Foo(a).bar((staticcall Foo(a).foo())[1])
+    )
     """
 
     c = get_contract(code)
     c2 = get_contract(code2)
 
-    assert c2.foo(c.address) == [1, 2, 3, 4, 5]
+    assert c2.foo(c.address) == (1, 2, 3, 4, 5)
 
 
 def test_single_type_tuple_int(get_contract):
@@ -156,8 +158,8 @@ def foo2(a: int128, b: int128) -> (int128[5], int128, int128[2]):
 
     c = get_contract(code)
 
-    assert c.foo() == [[1, 2, 3], 4, [[5, 6], [7, 8]]]
-    assert c.foo2(4, 6) == [[1, 2, 3, 4, 5], 6, [7, 8]]
+    assert c.foo() == ([1, 2, 3], 4, [[5, 6], [7, 8]])
+    assert c.foo2(4, 6) == ([1, 2, 3, 4, 5], 6, [7, 8])
 
 
 def test_single_type_tuple_address(get_contract):
@@ -173,13 +175,13 @@ def foo() -> (address, address[2]):
 
     c = get_contract(code)
 
-    assert c.foo() == [
+    assert c.foo() == (
         c.address,
         [
             "0xF5D4020dCA6a62bB1efFcC9212AAF3c9819E30D7",
             "0xFFfFfFffFFfffFFfFFfFFFFFffFFFffffFfFFFfF",
         ],
-    ]
+    )
 
 
 def test_single_type_tuple_bytes(get_contract):
@@ -192,4 +194,4 @@ def foo() -> (Bytes[5], Bytes[5]):
 
     c = get_contract(code)
 
-    assert c.foo() == [b"hello", b"there"]
+    assert c.foo() == (b"hello", b"there")

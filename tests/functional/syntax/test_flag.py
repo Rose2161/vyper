@@ -4,6 +4,7 @@ from vyper import compiler
 from vyper.exceptions import (
     FlagDeclarationException,
     InvalidOperation,
+    InvalidReference,
     NamespaceCollision,
     StructureException,
     TypeMismatch,
@@ -124,6 +125,17 @@ def foo():
     """,
         TypeMismatch,
     ),
+    (
+        """
+flag Status:
+  ACTIVE
+
+@external
+def test_assign_to_flag():
+  Status.ACTIVE = 2
+        """,
+        InvalidReference,
+    ),
 ]
 
 
@@ -158,10 +170,10 @@ struct Order:
 
 @external
 def run() -> Order:
-    return Order({
-        action: Action.BUY,
-        amount: 10**18
-        })
+    return Order(
+        action=Action.BUY,
+        amount=10**18
+        )
     """,
     "flag Foo:\n" + "\n".join([f"    member{i}" for i in range(256)]),
     """

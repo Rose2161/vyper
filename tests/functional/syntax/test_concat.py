@@ -1,7 +1,7 @@
 import pytest
 
 from vyper import compiler
-from vyper.exceptions import ArgumentException, InvalidType, TypeMismatch
+from vyper.exceptions import ArgumentException, TypeMismatch
 
 fail_list = [
     (
@@ -15,10 +15,18 @@ def cat(i1: Bytes[10], i2: Bytes[30]) -> Bytes[40]:
     (
         """
 @external
+def cat() -> Bytes[40]:
+    return concat(msg.data, b"hello")
+    """,
+        TypeMismatch,
+    ),
+    (
+        """
+@external
 def cat(i1: Bytes[10], i2: Bytes[30]) -> Bytes[40]:
     return concat(i1, 5)
     """,
-        InvalidType,
+        TypeMismatch,
     ),
     (
         """
@@ -85,12 +93,28 @@ def large_output(a: String[33], b: String[33], reverse=True) -> String[64]:
     """,
         ArgumentException,
     ),
+    (
+        """
+@external
+def foo(a: address) -> Bytes[100]:
+    return concat(a.code, b"suffix")
+    """,
+        TypeMismatch,
+    ),
+    (
+        """
+@external
+def foo() -> Bytes[50]:
+    return concat(b"prefix", msg.data, b"suffix")
+    """,
+        TypeMismatch,
+    ),
 ]
 
 
 @pytest.mark.parametrize("bad_code,exc", fail_list)
-def test_block_fail(assert_compile_failed, get_contract_with_gas_estimation, bad_code, exc):
-    assert_compile_failed(lambda: get_contract_with_gas_estimation(bad_code), exc)
+def test_block_fail(assert_compile_failed, get_contract, bad_code, exc):
+    assert_compile_failed(lambda: get_contract(bad_code), exc)
 
 
 valid_list = [

@@ -1,27 +1,27 @@
-SHELL := /bin/bash
-
-ifeq (, $(shell which pip3))
-	pip := $(shell which pip3)
-else
-	pip := $(shell which pip)
-endif
-
 .PHONY: test dev-deps lint clean clean-pyc clean-build clean-test docs
 
 init:
 	python setup.py install
 
 dev-init:
-	${pip} install .[dev]
+	pip install . --group dev
 
 test:
 	pytest
 
-mypy:
-	tox -e mypy
+lint: mypy black flake8 isort
 
-lint:
-	tox -e lint
+mypy:
+	mypy -p vyper
+
+black:
+	black vyper/ tests/ setup.py
+
+flake8: black
+	flake8 vyper/ tests/
+
+isort: black
+	isort vyper/ tests/ setup.py
 
 docs:
 	rm -f docs/vyper.rst

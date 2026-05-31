@@ -1,8 +1,9 @@
-from typing import Dict
-
 from vyper import ast as vy_ast
+from vyper.compiler.input_bundle import BUILTIN
+from vyper.compiler.settings import get_global_settings
 from vyper.exceptions import (
     ArrayIndexException,
+    FeatureException,
     InstantiationException,
     InvalidType,
     StructureException,
@@ -13,17 +14,18 @@ from vyper.semantics.analysis.levenshtein_utils import get_levenshtein_error_sug
 from vyper.semantics.data_locations import DataLocation
 from vyper.semantics.namespace import get_namespace
 from vyper.semantics.types.base import TYPE_T, VyperType
+from vyper.semantics.types.infinity import INF, WILDCARD, LengthUpperBound
 
 # TODO maybe this should be merged with .types/base.py
 
 
-def type_from_abi(abi_type: Dict) -> VyperType:
+def type_from_abi(abi_type: dict) -> VyperType:
     """
     Return a type object from an ABI type definition.
 
     Arguments
     ---------
-    abi_type : Dict
+    abi_type : dict
        A type definition taken from the `input` or `output` field of an ABI.
 
     Returns
@@ -32,7 +34,7 @@ def type_from_abi(abi_type: Dict) -> VyperType:
         Type definition object.
     """
     type_string = abi_type["type"]
-    if type_string == "fixed168x10":
+    if type_string == "int168" and abi_type.get("internalType") == "decimal":
         type_string = "decimal"
     if type_string in ("string", "bytes"):
         type_string = type_string.capitalize()
@@ -62,7 +64,7 @@ def type_from_abi(abi_type: Dict) -> VyperType:
             if type_string in ("Bytes", "String"):
                 # special handling for bytes, string, since
                 # the type ctor is in the namespace instead of a concrete type.
-                return t()
+                return t(WILDCARD)
             return t
         except KeyError:
             raise UnknownType(f"ABI contains unknown type: {type_string}") from None
@@ -84,13 +86,23 @@ def type_from_annotation(
     VyperType
         Type definition object.
     """
-    typ_ = _type_from_annotation(node)
+    typ = _type_from_annotation(node)
 
-    if location in typ_._invalid_locations:
+    if location in typ._invalid_locations:
         location_str = "" if location is DataLocation.UNSET else f"in {location.name.lower()}"
-        raise InstantiationException(f"{typ_} is not instantiable {location_str}", node)
+        raise InstantiationException(f"{typ} is not instantiable {location_str}", node)
 
-    return typ_
+    # TODO: cursed import cycle!
+    from vyper.semantics.types.primitives import DecimalT
+
+    # Gate uses of decimal outside of built-ins behind a flag
+    if isinstance(typ, DecimalT) and node.module_node.source_id != BUILTIN:
+        # is there a better place to put this check?
+        settings = get_global_settings()
+        if settings and not settings.get_enable_decimals():
+            raise FeatureException("decimals are not allowed unless `--enable-decimals` is set")
+
+    return typ
 
 
 def _type_from_annotation(node: vy_ast.VyperNode) -> VyperType:
@@ -117,24 +129,26 @@ def _type_from_annotation(node: vy_ast.VyperNode) -> VyperType:
     if isinstance(node, vy_ast.Attribute):
         # ex. SomeModule.SomeStruct
 
-        # sanity check - we only allow modules/interfaces to be
-        # imported as `Name`s currently.
-        if not isinstance(node.value, vy_ast.Name):
+        if isinstance(node.value, vy_ast.Attribute):
+            module_or_interface = _type_from_annotation(node.value)
+        elif isinstance(node.value, vy_ast.Name):
+            try:
+                module_or_interface = namespace[node.value.id]  # type: ignore
+            except UndeclaredDefinition:
+                raise InvalidType(err_msg, node) from None
+        else:
             raise InvalidType(err_msg, node)
 
-        try:
-            module_or_interface = namespace[node.value.id]  # type: ignore
-        except UndeclaredDefinition:
-            raise InvalidType(err_msg, node) from None
-
-        interface = module_or_interface
         if hasattr(module_or_interface, "module_t"):  # i.e., it's a ModuleInfo
-            interface = module_or_interface.module_t.interface
+            module_or_interface = module_or_interface.module_t
 
-        if not interface._attribute_in_annotation:
+        if not isinstance(module_or_interface, VyperType):
             raise InvalidType(err_msg, node)
 
-        type_t = interface.get_type_member(node.attr, node)
+        if not module_or_interface._attribute_in_annotation:
+            raise InvalidType(err_msg, node)
+
+        type_t = module_or_interface.get_type_member(node.attr, node)  # type: ignore
         assert isinstance(type_t, TYPE_T)  # sanity check
         return type_t.typedef
 
@@ -143,10 +157,9 @@ def _type_from_annotation(node: vy_ast.VyperNode) -> VyperType:
         raise InvalidType(err_msg, node)
 
     if node.id not in namespace:  # type: ignore
-        suggestions_str = get_levenshtein_error_suggestions(node.node_source_code, namespace, 0.3)
+        hint = get_levenshtein_error_suggestions(node.node_source_code, namespace, 0.3)
         raise UnknownType(
-            f"No builtin or user-defined type named '{node.node_source_code}'. {suggestions_str}",
-            node,
+            f"No builtin or user-defined type named '{node.node_source_code}'.", node, hint=hint
         ) from None
 
     typ_ = namespace[node.id]
@@ -156,18 +169,23 @@ def _type_from_annotation(node: vy_ast.VyperNode) -> VyperType:
         # call from_annotation to produce a better error message.
         typ_.from_annotation(node)
 
+    if hasattr(typ_, "module_t"):  # it's a ModuleInfo
+        typ_ = typ_.module_t
+
+    if not isinstance(typ_, VyperType):
+        raise InvalidType(err_msg, node)
+
     return typ_
 
 
-def get_index_value(node: vy_ast.Index) -> int:
+def get_index_value(node: vy_ast.VyperNode) -> LengthUpperBound:
     """
     Return the literal value for a `Subscript` index.
 
     Arguments
     ---------
-    node: vy_ast.Index
-        Vyper ast node from the `slice` member of a Subscript node. Must be an
-        `Index` object (Vyper does not support `Slice` or `ExtSlice`).
+    node: vy_ast.VyperNode
+        Vyper ast node from the `slice` member of a Subscript node.
 
     Returns
     -------
@@ -179,19 +197,30 @@ def get_index_value(node: vy_ast.Index) -> int:
     # TODO: revisit this!
     from vyper.semantics.analysis.utils import get_possible_types_from_node
 
-    if not isinstance(node.get("value"), vy_ast.Int):
-        if hasattr(node, "value"):
-            # even though the subscript is an invalid type, first check if it's a valid _something_
-            # this gives a more accurate error in case of e.g. a typo in a constant variable name
-            try:
-                get_possible_types_from_node(node.value)
-            except StructureException:
-                # StructureException is a very broad error, better to raise InvalidType in this case
-                pass
+    if isinstance(node, vy_ast.Ellipsis):
+        # module_node gives the module for the file, we need to check for inline interfaces as well
+        in_interface = node.module_node.is_interface or node.get_ancestor(vy_ast.InterfaceDef)
+        if not in_interface:
+            raise InvalidType("Wildcard length is only allowed in interfaces", node)
+        return WILDCARD
 
+    node = node.reduced()
+
+    # TODO: Maybe instead check that get_possible_types_from_node(node) is _Inf ?
+    if isinstance(node, vy_ast.Name) and node.id == "INF":
+        return INF
+
+    if not isinstance(node, vy_ast.Int):
+        # even though the subscript is an invalid type, first check if it's a valid _something_
+        # this gives a more accurate error in case of e.g. a typo in a constant variable name
+        try:
+            get_possible_types_from_node(node)
+        except StructureException:
+            # StructureException is a very broad error, better to raise InvalidType in this case
+            pass
         raise InvalidType("Subscript must be a literal integer", node)
 
-    if node.value.value <= 0:
+    if node.value <= 0:
         raise ArrayIndexException("Subscript must be greater than 0", node)
 
-    return node.value.value
+    return node.value

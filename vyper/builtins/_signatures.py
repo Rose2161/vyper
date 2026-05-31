@@ -1,12 +1,17 @@
 import functools
 from typing import Any, Optional
 
-from vyper.ast import nodes as vy_ast
+from vyper import ast as vy_ast
 from vyper.ast.validation import validate_call_args
 from vyper.codegen.expr import Expr
 from vyper.codegen.ir_node import IRnode
-from vyper.exceptions import CompilerPanic, TypeMismatch
-from vyper.semantics.analysis.utils import get_exact_type_from_node, validate_expected_type
+from vyper.exceptions import CompilerPanic, TypeMismatch, UnfoldableNode
+from vyper.semantics.analysis.base import Modifiability, StateMutability
+from vyper.semantics.analysis.utils import (
+    check_modifiability,
+    get_exact_type_from_node,
+    validate_expected_type,
+)
 from vyper.semantics.types import TYPE_T, KwargSettings, VyperType
 from vyper.semantics.types.utils import type_from_annotation
 
@@ -24,12 +29,12 @@ def process_arg(arg, expected_arg_type, context):
     if isinstance(expected_arg_type, VyperType):
         return Expr(arg, context).ir_node
 
-    raise CompilerPanic(f"Unexpected type: {expected_arg_type}")  # pragma: notest
+    raise CompilerPanic(f"Unexpected type: {expected_arg_type}")  # pragma: nocover
 
 
 def process_kwarg(kwarg_node, kwarg_settings, expected_kwarg_type, context):
     if kwarg_settings.require_literal:
-        return kwarg_node.value
+        return kwarg_node.get_folded_value().value
 
     return process_arg(kwarg_node, expected_kwarg_type, context)
 
@@ -75,16 +80,24 @@ def process_inputs(wrapped_fn):
 
 
 class BuiltinFunctionT(VyperType):
+    typeclass = "builtin_function"
+
     _has_varargs = False
     _inputs: list[tuple[str, Any]] = []
     _kwargs: dict[str, KwargSettings] = {}
+    _modifiability: Modifiability = Modifiability.MODIFIABLE
     _return_type: Optional[VyperType] = None
+    _equality_attrs = ("_id",)
+    _is_terminus = False
+    mutability: StateMutability = StateMutability.PURE
 
-    # helper function to deal with TYPE_DEFINITIONs
+    @property
+    def is_modifying(self) -> bool:
+        return self.mutability > StateMutability.VIEW
+
+    # helper function to deal with TYPE_Ts
     def _validate_single(self, arg: vy_ast.VyperNode, expected_type: VyperType) -> None:
-        # TODO using "TYPE_DEFINITION" is a kludge in derived classes,
-        # refactor me.
-        if expected_type == "TYPE_DEFINITION":
+        if TYPE_T.any().compare_type(expected_type):
             # try to parse the type - call type_from_annotation
             # for its side effects (will throw if is not a type)
             type_from_annotation(arg)
@@ -102,12 +115,18 @@ class BuiltinFunctionT(VyperType):
         validate_call_args(node, expect_num_args, list(self._kwargs.keys()))
 
         for arg, (_, expected) in zip(node.args, self._inputs):
+            # `expected` is sometimes not a VyperType
+            # This violates the contract of _validate_single, but it still works
             self._validate_single(arg, expected)
 
         for kwarg in node.keywords:
             kwarg_settings = self._kwargs[kwarg.arg]
-            if kwarg_settings.require_literal and not isinstance(kwarg.value, vy_ast.Constant):
-                raise TypeMismatch("Value for kwarg must be a literal", kwarg.value)
+            if kwarg_settings.require_literal and not check_modifiability(
+                kwarg.value, Modifiability.CONSTANT
+            ):
+                raise TypeMismatch("Value must be literal", kwarg.value)
+            # `kwarg_settings.typ` is sometimes not a VyperType
+            # This violates the contract of _validate_single, but it still works
             self._validate_single(kwarg.value, kwarg_settings.typ)
 
         # typecheck varargs. we don't have type info from the signature,
@@ -120,12 +139,15 @@ class BuiltinFunctionT(VyperType):
             # ensures the type can be inferred exactly.
             get_exact_type_from_node(arg)
 
+    def check_modifiability_for_call(self, node: vy_ast.Call, modifiability: Modifiability) -> bool:
+        return self._modifiability <= modifiability
+
     def fetch_call_return(self, node: vy_ast.Call) -> Optional[VyperType]:
         self._validate_arg_types(node)
 
         return self._return_type
 
-    def infer_arg_types(self, node: vy_ast.Call) -> list[VyperType]:
+    def infer_arg_types(self, node: vy_ast.Call, expected_return_typ=None) -> list[VyperType]:
         self._validate_arg_types(node)
         ret = [expected for (_, expected) in self._inputs]
 
@@ -142,3 +164,6 @@ class BuiltinFunctionT(VyperType):
 
     def __repr__(self):
         return f"(builtin) {self._id}"
+
+    def _try_fold(self, node):
+        raise UnfoldableNode(f"not foldable: {self}", node)
