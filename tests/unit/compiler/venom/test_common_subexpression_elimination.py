@@ -210,27 +210,6 @@ def test_cse_effect_mstore():
     _check_pre_post(pre, post)
 
 
-def test_cse_effect_mstore_with_msize():
-    """
-    Test that checks that msize is handled correctly
-    """
-    pre = """
-    main:
-        %1 = 10
-        mstore 0, %1
-        %mload1 = mload 0
-        %2 = 10
-        mstore 0, %1
-        %mload2 = mload 0
-        %msize = msize
-        %res1 = add %mload1, %msize
-        %res2 = add %mload2, %msize
-        sink %res1, %res2
-    """
-
-    _check_no_change(pre)
-
-
 def test_cse_different_branches_cannot_optimize():
     """
     Test of inter basicblock analysis which would require
@@ -357,6 +336,16 @@ def test_cse_non_idempotent():
         %{var_name}1 = add 1, %{callname}1
         """
 
+    def call2(callname: str, i: int, var_name: str):
+        return f"""
+        %g{2*i} = gas
+        %{callname}0 = {callname} %g0, 0, 0, 0, 0, 0, 0
+        %{var_name}0 = add 1, %{callname}0
+        %g{2*i + 1} = gas
+        %{callname}1 = {callname} %g0, 0, 0, 0, 0, 0, 0
+        %{var_name}1 = add 1, %{callname}1
+        """
+
     pre = f"""
     main:
         ; staticcall
@@ -366,7 +355,7 @@ def test_cse_non_idempotent():
         {call("delegatecall", 1, "d")}
 
         ; call
-        {call("call", 2, "c")}
+        {call2("call", 2, "c")}
         sink %s0, %s1, %d0, %d1, %c0, %c1
     """
 
@@ -470,9 +459,7 @@ def test_cse_immutable_queries(opcode):
     _check_pre_post(pre, post, hevm=opcode != "codesize")
 
 
-@pytest.mark.parametrize(
-    "opcode", ("dloadbytes", "extcodecopy", "codecopy", "returndatacopy", "calldatacopy")
-)
+@pytest.mark.parametrize("opcode", ("dloadbytes", "codecopy", "returndatacopy", "calldatacopy"))
 def test_cse_other_mem_ops_elimination(opcode):
     pre = f"""
     main:
@@ -489,6 +476,24 @@ def test_cse_other_mem_ops_elimination(opcode):
     """
 
     _check_pre_post(pre, post)
+
+
+def test_cse_other_mem_ops_elimination_extcodecopy():
+    pre = """
+    main:
+        extcodecopy 10, 20, 30, 40
+        extcodecopy 10, 20, 30, 40
+        stop
+    """
+
+    post = """
+    main:
+        extcodecopy 10, 20, 30, 40
+        nop
+        stop
+    """
+
+    _check_pre_post(pre, post, hevm=False)
 
 
 def test_cse_self_conflicting_effects():

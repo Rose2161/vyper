@@ -17,13 +17,14 @@ from vyper.utils import checksum_encode, int_bounds, is_checksum_encoded
 
 from .base import VyperType
 from .bytestrings import BytesT
+from .infinity import INF
 
 
 class _PrimT(VyperType):
     _is_prim_word = True
     _equality_attrs: tuple = ()
     _as_hashmap_key = True
-    _as_array = True
+    is_valid_element_type = True
 
 
 # should inherit from uint8?
@@ -411,7 +412,7 @@ class AddressT(_PrimT):
         "codehash": BytesM_T(32),
         "codesize": UINT(256),
         "is_contract": BoolT(),
-        "code": BytesT(),
+        "code": BytesT(INF),
     }
 
     @cached_property
@@ -440,4 +441,5 @@ class SelfT(AddressT):
 
     def compare_type(self, other):
         # compares true to AddressT
+        # This checks if either is a subtype of the other, which doesn't seem correct
         return isinstance(other, type(self)) or isinstance(self, type(other))
